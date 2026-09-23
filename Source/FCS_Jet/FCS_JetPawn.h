@@ -4,11 +4,13 @@
 
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
+#include "Flight/JetFlightParams.h"
 #include "FCS_JetPawn.generated.h"
 
 class UCameraComponent;
 class UInputAction;
 class UInputMappingContext;
+class UJetTuning;
 class UMaterialInstanceDynamic;
 class UPointLightComponent;
 class USpringArmComponent;
@@ -17,16 +19,21 @@ struct FHitResult;
 struct FInputActionValue;
 
 /**
- * Space fighter with War Thunder style keyboard controls.
+ * Space fighter with War Thunder style controls.
  *
- * No aerodynamics is simulated: there is no lift, drag, stall or gravity. The ship
- * simply translates along its nose direction at the current speed. The handling feel
- * comes from first order lag on the angular rates (current rate interpolates toward
- * the commanded rate) rather than from aerodynamic moments.
+ * No aerodynamics is simulated: no lift, no drag, no stall. Thrust points along the nose
+ * and gravity adds a separate vertical term below a set altitude, so the only way to
+ * climb is to point the nose up and out-run the descent. The handling feel comes from
+ * first order lag on the angular rates rather than from aerodynamic moments.
  *
- * Bindings: W nose down / S nose up / A D roll / Q E yaw
- *           Shift throttle up / Ctrl throttle down / Space afterburner
+ * Every tunable lives in FJetFlightParams, reached through GetParams. The pawn keeps no
+ * tunables of its own so they can be edited while flying, from a UJetTuning asset.
+ *
+ * Bindings: W nose down / S nose up / A D roll / Q E yaw / Shift throttle up
+ *           Ctrl throttle down / Space afterburner / R level off
  *           Hold right mouse button for free look
+ *           Left stick pitch and roll / LB RB yaw / RT LT throttle / Y level off
+ *           Right stick free look / A afterburner
  */
 UCLASS()
 class FCS_JET_API AFCS_JetPawn : public APawn
@@ -86,10 +93,17 @@ public:
 
 	/** True when the predicted impact is hard enough to destroy the ship. */
 	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
-	bool IsPredictedImpactFatal() const
-	{
-		return bImpactPredicted && PredictedImpactSpeed >= MinCrashImpactSpeed;
-	}
+	bool IsPredictedImpactFatal() const;
+
+	/**
+	 * The tunables in force right now: the Tuning asset's, or the code defaults when no
+	 * asset is assigned.
+	 *
+	 * Read fresh every frame rather than cached. Caching would be marginally cheaper and
+	 * would also defeat the entire point, since edits to the asset mid-flight would stop
+	 * taking effect.
+	 */
+	const FJetFlightParams& GetParams() const;
 
 	/** Normal speed of the impact that destroyed the ship, cm/s. Kept until the next one. */
 	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
@@ -114,7 +128,7 @@ protected:
 
 	/**
 	 * Clean root node.
-	 * The mesh needs a -90 degree yaw correction (see MeshYawCorrection in the cpp).
+	 * The mesh carries a yaw correction into the control frame (MeshYawOffsetDeg).
 	 * Parenting the spring arm under the mesh would force that yaw to be cancelled out
 	 * at every site that touches the arm, so the two are kept as siblings instead.
 	 */
@@ -142,214 +156,17 @@ protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Crash", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UPointLightComponent> BlastLight;
 
-	// ---------- Gravity ----------
+	// ---------- Tuning ----------
 
 	/**
-	 * Downward acceleration inside the gravity well, cm/s^2. 980 is Earth.
+	 * Where the tunables come from. Assigned on the Blueprint child so a designer can
+	 * point the ship at a different tuning without touching code.
 	 *
-	 * There is still no aerodynamics here: gravity is a separate vertical velocity that
-	 * accumulates, and the only way to climb is to point the nose up and let the thrust
-	 * vector out-run it. Nothing generates lift.
+	 * Null is a supported state: GetParams falls back to the code defaults, so a missing
+	 * or detached asset degrades the ship to its authored values rather than breaking it.
 	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
-	float GravityAcceleration = 980.f;
-
-	/** World Z at or below which gravity acts at full strength. 50000 cm is 500 m. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity")
-	float GravityCeilingZ = 50000.f;
-
-	/**
-	 * Band above the ceiling across which gravity fades out.
-	 * A hard on/off boundary makes the ship lurch as it crosses the line, so the
-	 * transition is spread over this distance instead.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
-	float GravityFalloffRange = 20000.f;
-
-	/**
-	 * Terminal fall speed, cm/s. Without a cap the fall would grow without bound, since
-	 * nothing here produces drag.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
-	float MaxFallSpeed = 3500.f;
-
-	/**
-	 * How fast an inherited descent bleeds away once the ship is clear of the falloff
-	 * band, per second. 0 keeps the descent forever.
-	 *
-	 * Strictly, momentum in a vacuum should be conserved. This model is not a momentum
-	 * model though: cutting the throttle drops the forward speed immediately with nothing
-	 * carried over, so holding the vertical component to a stricter standard than the
-	 * horizontal one is inconsistent. It also contradicts the ZERO-G readout, since a
-	 * ship that is visibly sinking is not what anyone reads "no gravity" to mean.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
-	float ZeroGFallDamping = 3.f;
-
-	// ---------- Crash ----------
-
-	/** Turn ground impacts off entirely and fly through everything. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash")
-	bool bCrashEnabled = true;
-
-	/**
-	 * Impact speed along the surface normal needed to destroy the ship, cm/s.
-	 *
-	 * The test is the normal component rather than the total speed on purpose: skimming
-	 * the deck at full throttle but level should scrape, not detonate, while any real
-	 * dive puts almost all of the speed into the normal and blows up as expected.
-	 * Below the threshold the ship touches down and slides along the surface.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.0"))
-	float MinCrashImpactSpeed = 4000.f;
-
-	/**
-	 * Radius of the sphere swept along the flight path each frame.
-	 * The hull half extents are roughly 387 x 413 x 299 cm, so this is the solid core
-	 * rather than the wingtips: clipping a wingtip on the deck should not be fatal.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "1.0"))
-	float HullRadius = 300.f;
-
-	/**
-	 * How far ahead the impact readout looks, expressed in seconds of travel at the
-	 * current speed rather than a fixed distance, so the warning arrives with roughly the
-	 * same amount of reaction time whether the ship is crawling or on afterburner.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.1"))
-	float ImpactWarningSeconds = 5.f;
-
-	/** Seconds from impact to respawn. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.1"))
-	float RespawnDelay = 2.5f;
-
-	/** Seconds the blast takes to expand and fade. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.05"))
-	float BlastDuration = 0.9f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "1.0"))
-	float BlastMaxRadius = 1100.f;
-
-	/**
-	 * Emissive multiplier at the instant of impact, decaying to zero over BlastDuration.
-	 * This is an additive unlit material, so anything much above about 8 drives every
-	 * channel past white and the fireball reads as a flat white disc with no colour left.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.0"))
-	float BlastPeakStrength = 6.f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash")
-	FLinearColor BlastColor = FLinearColor(1.0f, 0.42f, 0.10f, 1.0f);
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.0"))
-	float BlastLightPeakIntensity = 250000.f;
-
-	/** Peak camera shake in degrees, decaying over BlastDuration. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.0"))
-	float ShakeAmplitude = 3.0f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.1"))
-	float ShakeFrequency = 26.f;
-
-	// ---------- Speed ----------
-
-	/** Cruise speed at 100% throttle, cm/s. 12000 = 120 m/s = 432 km/h. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "0.0"))
-	float CruiseSpeed = 12000.f;
-
-	/** Speed at 0% throttle. A spacecraft can genuinely come to rest, hence 0. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "0.0"))
-	float IdleSpeed = 0.f;
-
-	/** Afterburner multiplier applied on top of the cruise speed. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "1.0"))
-	float AfterburnerMultiplier = 2.5f;
-
-	/** Throttle change per second. 0.5 means a full sweep takes two seconds. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "0.01"))
-	float ThrottleChangeRate = 0.5f;
-
-	/** How quickly actual speed catches up to the commanded speed (thrust lag). */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "0.01"))
-	float SpeedInterpSpeed = 1.2f;
-
-	/** Speed response while the afterburner is lit. Deliberately punchier. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Speed", meta = (ClampMin = "0.01"))
-	float AfterburnerInterpSpeed = 3.0f;
-
-	// ---------- Handling ----------
-
-	/** Maximum pitch rate, degrees per second. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "1.0"))
-	float PitchRate = 65.f;
-
-	/** Maximum roll rate. Fighters roll far faster than they pitch. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "1.0"))
-	float RollRate = 140.f;
-
-	/** Maximum yaw rate. The slowest axis, as on a real fighter. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "1.0"))
-	float YawRate = 40.f;
-
-	/**
-	 * How fast the angular rate chases the commanded rate. This is the single knob
-	 * that decides how heavy the ship feels.
-	 * Higher = crisper and more twitchy, lower = heavier with more inertia.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "0.1"))
-	float ControlInterpSpeed = 5.f;
-
-	/**
-	 * Proportional gain for the level-off, in commanded degrees per second per degree of
-	 * error. 2.5 means a 60 degree bank asks for 150 deg/s, which the roll limit then
-	 * clips to 140, so the correction runs at full rate until the last 56 degrees and
-	 * eases in from there.
-	 *
-	 * The commanded rate is clamped to the same PitchRate and RollRate the player gets,
-	 * so levelling can never out-turn the ship's own handling.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "0.1"))
-	float AutoLevelGain = 2.5f;
-
-	// ---------- Camera ----------
-
-	/** Mouse free look gain. The mouse reports a delta, so this is not a rate. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.01"))
-	float FreeLookSensitivity = 2.2f;
-
-	/**
-	 * Right stick free look rate at full deflection, degrees per second.
-	 *
-	 * The stick holds a position rather than reporting a delta, so it has to drive a rate
-	 * or the pan speed would depend on the frame rate.
-	 */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "1.0"))
-	float FreeLookStickRate = 140.f;
-
-	/** How fast the view recenters after the right mouse button is released. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.1"))
-	float FreeLookReturnSpeed = 8.f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", ClampMax = "180.0"))
-	float FreeLookYawLimit = 170.f;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0", ClampMax = "89.0"))
-	float FreeLookPitchLimit = 80.f;
-
-	/** Invert the free look vertical axis. Purely a matter of personal preference. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera")
-	bool bInvertFreeLookPitch = false;
-
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "30.0", ClampMax = "170.0"))
-	float BaseFOV = 90.f;
-
-	/** Extra field of view while the afterburner is lit, to sell the speed. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.0"))
-	float AfterburnerFOVBonus = 14.f;
-
-	/** Draw speed / throttle / rate readout in the corner of the screen. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
-	bool bShowFlightReadout = true;
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Flight")
+	TObjectPtr<UJetTuning> Tuning;
 
 	// ---------- Input assets ----------
 
@@ -418,26 +235,44 @@ private:
 	void OnFreeLookStop();
 
 	// ---------- Per frame steps ----------
+	//
+	// Every step takes the params by reference rather than reaching for them itself, so
+	// one frame always runs on one consistent set of values even if the asset is edited
+	// mid-frame from the details panel.
 
-	void TickThrottle(float DeltaSeconds);
-	void TickAttitude(float DeltaSeconds);
-	void TickGravity(float DeltaSeconds);
-	void TickImpactPrediction();
-	void TickTranslation(float DeltaSeconds);
-	void TickCrash(float DeltaSeconds);
-	void TickCamera(float DeltaSeconds);
-	void DrawReadout() const;
+	void TickThrottle(float DeltaSeconds, const FJetFlightParams& P);
+	void TickAttitude(float DeltaSeconds, const FJetFlightParams& P);
+	void TickGravity(float DeltaSeconds, const FJetFlightParams& P);
+	void TickImpactPrediction(const FJetFlightParams& P);
+	void TickTranslation(float DeltaSeconds, const FJetFlightParams& P);
+	void TickCrash(float DeltaSeconds, const FJetFlightParams& P);
+	void TickCamera(float DeltaSeconds, const FJetFlightParams& P);
+	void DrawReadout(const FJetFlightParams& P) const;
+
+	/** Push the camera and spring arm tunables onto the components. */
+	void ApplyCameraParams(const FJetFlightParams& P);
+
+	/** Push the mesh frame tunables onto the mesh component. */
+	void ApplyMeshParams(const FJetFlightParams& P);
 
 	/** Gravity strength at a given world height: 1 below the ceiling, 0 well above it. */
-	float GetGravityScaleAtZ(float WorldZ) const;
+	float GetGravityScaleAtZ(float WorldZ, const FJetFlightParams& P) const;
 
 	/** Touched down too slowly to break: kill the descent and slide along the surface. */
 	void TouchDown(const FHitResult& Hit, const FVector& RemainingDelta);
 
-	void BeginCrash(const FHitResult& Hit, float ImpactSpeed);
-	void Respawn();
+	void BeginCrash(const FHitResult& Hit, float ImpactSpeed, const FJetFlightParams& P);
+	void Respawn(const FJetFlightParams& P);
 
 	// ---------- Runtime state ----------
+
+	/**
+	 * Authored defaults, used whenever no Tuning asset is assigned.
+	 *
+	 * A plain member rather than a static, so the values come from FJetFlightParams's own
+	 * initialisers and there is exactly one place where a default is written down.
+	 */
+	FJetFlightParams DefaultParams;
 
 	/** Commanded input for this frame, -1..1. */
 	float PitchInput = 0.f;
@@ -497,10 +332,10 @@ private:
 	/**
 	 * Frames of camera lag suppression still owed after a respawn teleport. Without this
 	 * the lagged camera sweeps across the whole map to catch up with the ship.
+	 *
+	 * ApplyCameraParams runs at the top of every TickCamera, so the flags come back from
+	 * the params on their own once this reaches zero.
 	 */
 	int32 CameraSnapFramesLeft = 0;
 
-	/** Lag flags as authored, captured at BeginPlay so the snap can restore them. */
-	bool bDefaultCameraLag = true;
-	bool bDefaultCameraRotationLag = true;
 };
