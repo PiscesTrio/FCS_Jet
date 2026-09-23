@@ -132,6 +132,19 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
 	float MaxFallSpeed = 3500.f;
 
+	/**
+	 * How fast an inherited descent bleeds away once the ship is clear of the falloff
+	 * band, per second. 0 keeps the descent forever.
+	 *
+	 * Strictly, momentum in a vacuum should be conserved. This model is not a momentum
+	 * model though: cutting the throttle drops the forward speed immediately with nothing
+	 * carried over, so holding the vertical component to a stricter standard than the
+	 * horizontal one is inconsistent. It also contradicts the ZERO-G readout, since a
+	 * ship that is visibly sinking is not what anyone reads "no gravity" to mean.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Gravity", meta = (ClampMin = "0.0"))
+	float ZeroGFallDamping = 3.f;
+
 	// ---------- Crash ----------
 
 	/** Turn ground impacts off entirely and fly through everything. */

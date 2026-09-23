@@ -385,12 +385,20 @@ void AFCS_JetPawn::TickGravity(float DeltaSeconds)
 {
 	const float Scale = GetGravityScaleAtZ(GetActorLocation().Z);
 
-	// Out in space the accumulated fall speed is simply kept. Nothing out there would
-	// remove it, and bleeding it off would mean inventing a drag force that does not
-	// belong in a vacuum.
 	if (Scale > 0.f)
 	{
 		FallSpeed = FMath::Min(FallSpeed + GravityAcceleration * Scale * DeltaSeconds, MaxFallSpeed);
+	}
+	else if (ZeroGFallDamping > 0.f)
+	{
+		// Clear of the band, a descent carried up from below bleeds away instead of being
+		// kept forever. See ZeroGFallDamping for why conserving it is the wrong call here.
+		//
+		// Damping is gated on the band being fully behind the ship rather than scaled
+		// across it. Blending the two against each other inside the band would give
+		// partial gravity its own much lower terminal velocity, which is not what a
+		// thinning gravity well should feel like.
+		FallSpeed = FMath::FInterpTo(FallSpeed, 0.f, DeltaSeconds, ZeroGFallDamping);
 	}
 }
 
