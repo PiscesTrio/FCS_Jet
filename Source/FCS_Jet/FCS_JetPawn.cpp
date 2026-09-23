@@ -54,6 +54,13 @@ namespace
 
 	/** Below this the ship is effectively parked and the ground sweep is pointless. */
 	constexpr float MinSweepSpeed = 1.f;
+
+	/**
+	 * Stick deflection that counts as "the player is looking around".
+	 * The mapping already applies a 0.2 radial deadzone, so anything arriving here is a
+	 * deliberate push; this only guards against the last sliver of noise.
+	 */
+	constexpr float StickLookEngageThreshold = 0.05f;
 }
 
 AFCS_JetPawn::AFCS_JetPawn()
@@ -152,6 +159,8 @@ AFCS_JetPawn::AFCS_JetPawn()
 		TEXT("/Game/FCS_Jet/Input/IA_FreeLook.IA_FreeLook"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> LookAsset(
 		TEXT("/Game/FCS_Jet/Input/IA_Look.IA_Look"));
+	static ConstructorHelpers::FObjectFinder<UInputAction> LookStickAsset(
+		TEXT("/Game/FCS_Jet/Input/IA_LookStick.IA_LookStick"));
 
 	DefaultMappingContext = ImcAsset.Succeeded() ? ImcAsset.Object : nullptr;
 	PitchAction = PitchAsset.Succeeded() ? PitchAsset.Object : nullptr;
@@ -161,6 +170,7 @@ AFCS_JetPawn::AFCS_JetPawn()
 	AfterburnerAction = AfterburnerAsset.Succeeded() ? AfterburnerAsset.Object : nullptr;
 	FreeLookAction = FreeLookAsset.Succeeded() ? FreeLookAsset.Object : nullptr;
 	LookAction = LookAsset.Succeeded() ? LookAsset.Object : nullptr;
+	LookStickAction = LookStickAsset.Succeeded() ? LookStickAsset.Object : nullptr;
 }
 
 void AFCS_JetPawn::ApplyMappingContext(const TCHAR* CallSite)
@@ -282,6 +292,12 @@ void AFCS_JetPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 	{
 		EIC->BindAction(LookAction, ETriggerEvent::Triggered, this, &AFCS_JetPawn::OnLook);
 	}
+	if (LookStickAction)
+	{
+		EIC->BindAction(LookStickAction, ETriggerEvent::Triggered, this, &AFCS_JetPawn::OnLookStick);
+		EIC->BindAction(LookStickAction, ETriggerEvent::Completed, this, &AFCS_JetPawn::OnLookStickReleased);
+		EIC->BindAction(LookStickAction, ETriggerEvent::Canceled, this, &AFCS_JetPawn::OnLookStickReleased);
+	}
 
 	// By this point the controller definitely has a local player, which is not guaranteed
 	// when NotifyControllerChanged runs.
@@ -307,6 +323,17 @@ void AFCS_JetPawn::OnLook(const FInputActionValue& Value)
 {
 	// The mouse reports a delta, so accumulate here and let TickCamera consume it.
 	LookInput += Value.Get<FVector2D>();
+}
+
+void AFCS_JetPawn::OnLookStick(const FInputActionValue& Value)
+{
+	// The stick reports a position, so it is stored rather than accumulated.
+	StickLookInput = Value.Get<FVector2D>();
+}
+
+void AFCS_JetPawn::OnLookStickReleased()
+{
+	StickLookInput = FVector2D::ZeroVector;
 }
 
 void AFCS_JetPawn::Tick(float DeltaSeconds)
@@ -640,17 +667,24 @@ void AFCS_JetPawn::Respawn()
 
 void AFCS_JetPawn::TickCamera(float DeltaSeconds)
 {
-	if (bFreeLookHeld)
-	{
-		// Raw mouse Y is negative when the mouse is pushed forward, so the sign is
-		// flipped to make "push the mouse up" mean "look up".
-		const float PitchSign = bInvertFreeLookPitch ? 1.f : -1.f;
+	// The right stick engages free look by being deflected at all. It is the only free
+	// look control on a pad, so requiring a separate hold button would waste one.
+	const bool bStickLooking = StickLookInput.SizeSquared() > FMath::Square(StickLookEngageThreshold);
 
-		FreeLookOffset.X = FMath::Clamp(
-			FreeLookOffset.X + LookInput.X * FreeLookSensitivity,
+	if (bFreeLookHeld || bStickLooking)
+	{
+		// Raw mouse Y is negative when pushed forward while stick Y is positive, so both
+		// are normalised to "positive means look up" before the invert preference applies.
+		const float LookRight = LookInput.X * FreeLookSensitivity
+			+ StickLookInput.X * FreeLookStickRate * DeltaSeconds;
+		const float LookUp = -LookInput.Y * FreeLookSensitivity
+			+ StickLookInput.Y * FreeLookStickRate * DeltaSeconds;
+
+		const float PitchSign = bInvertFreeLookPitch ? -1.f : 1.f;
+
+		FreeLookOffset.X = FMath::Clamp(FreeLookOffset.X + LookRight,
 			-FreeLookYawLimit, FreeLookYawLimit);
-		FreeLookOffset.Y = FMath::Clamp(
-			FreeLookOffset.Y + PitchSign * LookInput.Y * FreeLookSensitivity,
+		FreeLookOffset.Y = FMath::Clamp(FreeLookOffset.Y + PitchSign * LookUp,
 			-FreeLookPitchLimit, FreeLookPitchLimit);
 	}
 	else

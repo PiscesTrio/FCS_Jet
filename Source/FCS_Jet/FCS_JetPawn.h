@@ -287,8 +287,18 @@ protected:
 
 	// ---------- Camera ----------
 
+	/** Mouse free look gain. The mouse reports a delta, so this is not a rate. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.01"))
 	float FreeLookSensitivity = 2.2f;
+
+	/**
+	 * Right stick free look rate at full deflection, degrees per second.
+	 *
+	 * The stick holds a position rather than reporting a delta, so it has to drive a rate
+	 * or the pan speed would depend on the frame rate.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "1.0"))
+	float FreeLookStickRate = 140.f;
 
 	/** How fast the view recenters after the right mouse button is released. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera", meta = (ClampMin = "0.1"))
@@ -341,6 +351,10 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> LookAction;
 
+	/** Right stick free look. Separate from LookAction because a stick is not a delta. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> LookStickAction;
+
 private:
 	/**
 	 * Push the mapping context into the local player's Enhanced Input subsystem.
@@ -359,6 +373,8 @@ private:
 	void OnYaw(const FInputActionValue& Value);
 	void OnThrottle(const FInputActionValue& Value);
 	void OnLook(const FInputActionValue& Value);
+	void OnLookStick(const FInputActionValue& Value);
+	void OnLookStickReleased();
 
 	void OnPitchReleased();
 	void OnRollReleased();
@@ -400,6 +416,12 @@ private:
 
 	/** Accumulated mouse delta, consumed and cleared every frame. */
 	FVector2D LookInput = FVector2D::ZeroVector;
+
+	/**
+	 * Right stick deflection, -1..1 per axis. Held rather than cleared, since the stick
+	 * reports a sustained position and its own Completed event zeroes it on release.
+	 */
+	FVector2D StickLookInput = FVector2D::ZeroVector;
 
 	bool bAfterburnerHeld = false;
 	bool bFreeLookHeld = false;
