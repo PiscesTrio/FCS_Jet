@@ -1,7 +1,9 @@
 // FCS_Jet - space flight pawn (no aerodynamics)
 
-#include "FCS_JetPawn.h"
+#include "Flight/FCS_JetPawn.h"
 
+#include "Flight/FlightControlMath.h"
+#include "Flight/JetTelemetry.h"
 #include "Flight/JetTuning.h"
 
 #include "Camera/CameraComponent.h"
@@ -386,50 +388,24 @@ void AFCS_JetPawn::Tick(float DeltaSeconds)
 	}
 
 	TickCamera(DeltaSeconds, P);
-	DrawReadout(P);
+	JetReadout::Draw(BuildTelemetry(P), P);
 }
 
 void AFCS_JetPawn::TickThrottle(float DeltaSeconds, const FJetFlightParams& P)
 {
-	if (!FMath::IsNearlyZero(ThrottleInput))
-	{
-		Throttle = FMath::Clamp(
-			Throttle + ThrottleInput * P.ThrottleChangeRate * DeltaSeconds, 0.f, 1.f);
-	}
-
-	const float Boost = bAfterburnerHeld ? P.AfterburnerMultiplier : 1.f;
-	const float TargetSpeed = FMath::Lerp(P.IdleSpeed, P.CruiseSpeed, Throttle) * Boost;
-	const float Responsiveness = bAfterburnerHeld ? P.AfterburnerInterpSpeed : P.SpeedInterpSpeed;
-
-	CurrentSpeed = FMath::FInterpTo(CurrentSpeed, TargetSpeed, DeltaSeconds, Responsiveness);
+	Throttle = FlightMath::UpdateThrottle(Throttle, ThrottleInput, DeltaSeconds, P);
+	CurrentSpeed = FlightMath::UpdateSpeed(CurrentSpeed, Throttle, bAfterburnerHeld,
+		DeltaSeconds, P);
 }
 
 void AFCS_JetPawn::TickAttitude(float DeltaSeconds, const FJetFlightParams& P)
 {
+	const FVector Target = FlightMath::TargetRates(PitchInput, YawInput, RollInput,
+		bAutoLevelHeld, GetActorRotation(), P);
+
 	// There are no aerodynamic moments, so the entire handling character lives in this
 	// one interpolation.
-	FVector TargetRates(PitchInput * P.PitchRate, YawInput * P.YawRate, RollInput * P.RollRate);
-
-	if (bAutoLevelHeld)
-	{
-		// Level means wings level and nose on the horizon. Yaw is deliberately left with
-		// the player: which way the ship points is their intent, not something to take
-		// away while they are only asking to stop tumbling.
-		//
-		// The correction is proportional on the pitch and roll angles rather than a
-		// quaternion shortest arc. The two are coupled while banked, but roll is the far
-		// faster axis here, so it wins the race and the pitch term becomes accurate as
-		// the wings come level. Convergence from inverted and from near vertical is
-		// measured rather than assumed.
-		const FRotator Current = GetActorRotation();
-		const float PitchError = FRotator::NormalizeAxis(-Current.Pitch);
-		const float RollError = FRotator::NormalizeAxis(-Current.Roll);
-
-		TargetRates.X = FMath::Clamp(PitchError * P.AutoLevelGain, -P.PitchRate, P.PitchRate);
-		TargetRates.Z = FMath::Clamp(RollError * P.AutoLevelGain, -P.RollRate, P.RollRate);
-	}
-
-	CurrentRates = FMath::VInterpTo(CurrentRates, TargetRates, DeltaSeconds, P.ControlInterpSpeed);
+	CurrentRates = FMath::VInterpTo(CurrentRates, Target, DeltaSeconds, P.ControlInterpSpeed);
 
 	const FRotator DeltaRotation(
 		CurrentRates.X * DeltaSeconds,   // Pitch
@@ -441,28 +417,14 @@ void AFCS_JetPawn::TickAttitude(float DeltaSeconds, const FJetFlightParams& P)
 	AddActorLocalRotation(DeltaRotation.Quaternion());
 }
 
-float AFCS_JetPawn::GetGravityScaleAtZ(float WorldZ, const FJetFlightParams& P) const
-{
-	if (WorldZ <= P.GravityCeilingZ)
-	{
-		return 1.f;
-	}
-	if (P.GravityFalloffRange <= KINDA_SMALL_NUMBER)
-	{
-		return 0.f;
-	}
-	const float Above = WorldZ - P.GravityCeilingZ;
-	return FMath::Clamp(1.f - Above / P.GravityFalloffRange, 0.f, 1.f);
-}
-
 float AFCS_JetPawn::GetGravityScale() const
 {
-	return GetGravityScaleAtZ(GetActorLocation().Z, GetParams());
+	return FlightMath::GravityScaleAtZ(GetActorLocation().Z, GetParams());
 }
 
 void AFCS_JetPawn::TickGravity(float DeltaSeconds, const FJetFlightParams& P)
 {
-	const float Scale = GetGravityScaleAtZ(GetActorLocation().Z, P);
+	const float Scale = FlightMath::GravityScaleAtZ(GetActorLocation().Z, P);
 
 	if (Scale > 0.f)
 	{
@@ -492,7 +454,7 @@ void AFCS_JetPawn::TickImpactPrediction(const FJetFlightParams& P)
 		return;
 	}
 
-	const FVector Velocity = GetActorForwardVector() * CurrentSpeed + FVector(0.f, 0.f, -FallSpeed);
+	const FVector Velocity = FlightMath::Velocity(GetActorForwardVector(), CurrentSpeed, FallSpeed);
 	const float Speed = Velocity.Size();
 	if (Speed <= P.MinSweepSpeed)
 	{
@@ -515,15 +477,13 @@ void AFCS_JetPawn::TickImpactPrediction(const FJetFlightParams& P)
 
 	bImpactPredicted = true;
 	// Same measure the crash test uses, so the readout and the outcome cannot disagree.
-	PredictedImpactSpeed = FMath::Abs(FVector::DotProduct(Velocity, Hit.ImpactNormal));
+	PredictedImpactSpeed = FlightMath::ImpactNormalSpeed(Velocity, Hit.ImpactNormal);
 	PredictedImpactTime = (Hit.Distance > 0.f) ? Hit.Distance / Speed : 0.f;
 }
 
 void AFCS_JetPawn::TickTranslation(float DeltaSeconds, const FJetFlightParams& P)
 {
-	// Thrust always points along the nose, with no sideslip and no carried momentum, and
-	// gravity adds a separate vertical term on top. Still no lift or drag anywhere.
-	const FVector Velocity = GetActorForwardVector() * CurrentSpeed + FVector(0.f, 0.f, -FallSpeed);
+	const FVector Velocity = FlightMath::Velocity(GetActorForwardVector(), CurrentSpeed, FallSpeed);
 	const FVector Delta = Velocity * DeltaSeconds;
 
 	// Collision is detected by sweeping a sphere along the path rather than by enabling
@@ -550,7 +510,7 @@ void AFCS_JetPawn::TickTranslation(float DeltaSeconds, const FJetFlightParams& P
 
 			// How hard the surface was actually hit, rather than how fast the ship was
 			// travelling. See MinCrashImpactSpeed.
-			const float ImpactSpeed = FMath::Abs(FVector::DotProduct(Velocity, Hit.ImpactNormal));
+			const float ImpactSpeed = FlightMath::ImpactNormalSpeed(Velocity, Hit.ImpactNormal);
 
 			if (ImpactSpeed >= P.MinCrashImpactSpeed)
 			{
@@ -642,18 +602,16 @@ void AFCS_JetPawn::TickCrash(float DeltaSeconds, const FJetFlightParams& P)
 {
 	CrashElapsed += DeltaSeconds;
 
-	const float Alpha = FMath::Clamp(CrashElapsed / P.BlastDuration, 0.f, 1.f);
-	const float Fade = FMath::Square(1.f - Alpha);
+	const float Alpha = FlightMath::BlastAlpha(CrashElapsed, P);
 
 	if (BlastMesh && BlastMesh->IsVisible())
 	{
-		// Ease out so the fireball punches open and then slows, rather than growing linearly.
-		const float Radius = P.BlastMaxRadius * (1.f - FMath::Square(1.f - Alpha));
-		BlastMesh->SetWorldScale3D(FVector(Radius / BasicSphereRadius));
+		BlastMesh->SetWorldScale3D(FVector(FlightMath::BlastRadius(Alpha, P) / BasicSphereRadius));
 
 		if (BlastMaterial)
 		{
-			BlastMaterial->SetScalarParameterValue(TEXT("FlashStrength"), P.BlastPeakStrength * Fade);
+			BlastMaterial->SetScalarParameterValue(TEXT("FlashStrength"),
+				FlightMath::BlastStrength(Alpha, P));
 		}
 		if (Alpha >= 1.f)
 		{
@@ -663,7 +621,7 @@ void AFCS_JetPawn::TickCrash(float DeltaSeconds, const FJetFlightParams& P)
 
 	if (BlastLight && BlastLight->IsVisible())
 	{
-		BlastLight->SetIntensity(P.BlastLightPeakIntensity * Fade * (1.f - Alpha));
+		BlastLight->SetIntensity(FlightMath::BlastLightIntensity(Alpha, P));
 		if (Alpha >= 1.f)
 		{
 			BlastLight->SetIntensity(0.f);
@@ -718,29 +676,10 @@ void AFCS_JetPawn::TickCamera(float DeltaSeconds, const FJetFlightParams& P)
 {
 	// The right stick engages free look by being deflected at all. It is the only free
 	// look control on a pad, so requiring a separate hold button would waste one.
-	const bool bStickLooking = StickLookInput.SizeSquared() > FMath::Square(P.StickLookEngageThreshold);
+	const bool bLooking = bFreeLookHeld || FlightMath::IsStickLooking(StickLookInput, P);
 
-	if (bFreeLookHeld || bStickLooking)
-	{
-		// Raw mouse Y is negative when pushed forward while stick Y is positive, so both
-		// are normalised to "positive means look up" before the invert preference applies.
-		const float LookRight = LookInput.X * P.FreeLookSensitivity
-			+ StickLookInput.X * P.FreeLookStickRate * DeltaSeconds;
-		const float LookUp = -LookInput.Y * P.FreeLookSensitivity
-			+ StickLookInput.Y * P.FreeLookStickRate * DeltaSeconds;
-
-		const float PitchSign = P.bInvertFreeLookPitch ? -1.f : 1.f;
-
-		FreeLookOffset.X = FMath::Clamp(FreeLookOffset.X + LookRight,
-			-P.FreeLookYawLimit, P.FreeLookYawLimit);
-		FreeLookOffset.Y = FMath::Clamp(FreeLookOffset.Y + PitchSign * LookUp,
-			-P.FreeLookPitchLimit, P.FreeLookPitchLimit);
-	}
-	else
-	{
-		FreeLookOffset = FMath::Vector2DInterpTo(
-			FreeLookOffset, FVector2D::ZeroVector, DeltaSeconds, P.FreeLookReturnSpeed);
-	}
+	FreeLookOffset = FlightMath::UpdateFreeLook(FreeLookOffset, LookInput, StickLookInput,
+		bLooking, DeltaSeconds, P);
 
 	LookInput = FVector2D::ZeroVector;
 
@@ -749,16 +688,9 @@ void AFCS_JetPawn::TickCamera(float DeltaSeconds, const FJetFlightParams& P)
 	ApplyCameraParams(P);
 
 	FRotator ArmRotation(FreeLookOffset.Y, FreeLookOffset.X, 0.f);
-
-	// Impact shake. Two different frequencies so the pitch and yaw components do not move
-	// in lockstep, which would read as a single clean wobble rather than a jolt.
-	if (bCrashed && CrashElapsed < P.BlastDuration && P.ShakeAmplitude > 0.f)
+	if (bCrashed)
 	{
-		const float Decay = FMath::Square(1.f - FMath::Clamp(CrashElapsed / P.BlastDuration, 0.f, 1.f));
-		const float Amount = P.ShakeAmplitude * Decay;
-		ArmRotation.Pitch += Amount * FMath::Sin(CrashElapsed * P.ShakeFrequency);
-		ArmRotation.Yaw += Amount * FMath::Sin(CrashElapsed * P.ShakeFrequency * 1.37f + 1.1f);
-		ArmRotation.Roll += Amount * 0.5f * FMath::Sin(CrashElapsed * P.ShakeFrequency * 0.83f + 2.2f);
+		ArmRotation += FlightMath::ShakeOffset(CrashElapsed, P);
 	}
 
 	SpringArm->SetRelativeRotation(ArmRotation);
@@ -775,95 +707,25 @@ void AFCS_JetPawn::TickCamera(float DeltaSeconds, const FJetFlightParams& P)
 		FMath::FInterpTo(Camera->FieldOfView, TargetFOV, DeltaSeconds, P.FOVInterpSpeed));
 }
 
-void AFCS_JetPawn::DrawReadout(const FJetFlightParams& P) const
+FJetTelemetry AFCS_JetPawn::BuildTelemetry(const FJetFlightParams& P) const
 {
-	if (!P.bShowFlightReadout || !GEngine)
-	{
-		return;
-	}
-
-	// The on screen debug font has no CJK glyphs, so this readout stays ASCII only.
-	const int32 Filled = FMath::RoundToInt(Throttle * 10.f);
-	FString Bar;
-	for (int32 i = 0; i < 10; ++i)
-	{
-		Bar += (i < Filled) ? TEXT("|") : TEXT(".");
-	}
-
-	GEngine->AddOnScreenDebugMessage(101, 0.f, FColor::Cyan,
-		FString::Printf(TEXT("SPD  %6.0f km/h   (%5.0f m/s)"),
-			CurrentSpeed * CmsToKmh, CurrentSpeed * 0.01f));
-
-	GEngine->AddOnScreenDebugMessage(102, 0.f, bAfterburnerHeld ? FColor::Orange : FColor::Green,
-		FString::Printf(TEXT("THR  [%s] %3.0f%%%s"), *Bar, Throttle * 100.f,
-			bAfterburnerHeld ? TEXT("   AFTERBURNER") : TEXT("")));
-
-	GEngine->AddOnScreenDebugMessage(103, 0.f, FColor::White,
-		FString::Printf(TEXT("RATE P %6.1f   Y %6.1f   R %6.1f  deg/s"),
-			CurrentRates.X, CurrentRates.Y, CurrentRates.Z));
-
-	const float GravityScale = GetGravityScale();
-	GEngine->AddOnScreenDebugMessage(106, 0.f,
-		GravityScale > 0.f ? FColor::Yellow : FColor::Cyan,
-		FString::Printf(TEXT("ALT %7.0f m   GRAV %3.0f%%%s   VS %+6.0f m/s"),
-			GetActorLocation().Z * 0.01f,
-			GravityScale * 100.f,
-			GravityScale > 0.f ? TEXT("") : TEXT("  ZERO-G"),
-			-FallSpeed * 0.01f));
-
-	if (bFreeLookHeld)
-	{
-		GEngine->AddOnScreenDebugMessage(104, 0.f, FColor::Yellow,
-			FString::Printf(TEXT("FREE LOOK  yaw %5.0f  pitch %5.0f"),
-				FreeLookOffset.X, FreeLookOffset.Y));
-	}
-	else
-	{
-		GEngine->RemoveOnScreenDebugMessage(104);
-	}
-
-	if (bAutoLevelHeld)
-	{
-		const FRotator Now = GetActorRotation();
-		GEngine->AddOnScreenDebugMessage(108, 0.f, FColor::Orange,
-			FString::Printf(TEXT("AUTO-LEVEL   pitch %+5.1f   roll %+6.1f"),
-				FRotator::NormalizeAxis(Now.Pitch), FRotator::NormalizeAxis(Now.Roll)));
-	}
-	else
-	{
-		GEngine->RemoveOnScreenDebugMessage(108);
-	}
-
-	if (bCrashed)
-	{
-		GEngine->AddOnScreenDebugMessage(105, 0.f, FColor::Red,
-			FString::Printf(TEXT("GROUND IMPACT  %.0f km/h  -  respawn in %.1f s"),
-				LastImpactSpeed * CmsToKmh,
-				FMath::Max(0.f, P.RespawnDelay - CrashElapsed)));
-		GEngine->RemoveOnScreenDebugMessage(107);
-	}
-	else
-	{
-		GEngine->RemoveOnScreenDebugMessage(105);
-
-		// The number that decides the outcome, live, next to the threshold it is judged
-		// against. Reporting it only after the fact would be useless for staying alive.
-		if (bImpactPredicted)
-		{
-			const bool bFatal = PredictedImpactSpeed >= P.MinCrashImpactSpeed;
-			GEngine->AddOnScreenDebugMessage(107, 0.f,
-				bFatal ? FColor::Red : FColor::Green,
-				FString::Printf(TEXT("IMPACT %5.0f km/h in %4.1f s   limit %.0f   %s"),
-					PredictedImpactSpeed * CmsToKmh,
-					PredictedImpactTime,
-					P.MinCrashImpactSpeed * CmsToKmh,
-					bFatal ? TEXT("FATAL") : TEXT("survivable")));
-		}
-		else
-		{
-			GEngine->AddOnScreenDebugMessage(107, 0.f, FColor::Silver,
-				FString::Printf(TEXT("IMPACT     -              limit %.0f   clear"),
-					P.MinCrashImpactSpeed * CmsToKmh));
-		}
-	}
+	FJetTelemetry T;
+	T.SpeedCms = CurrentSpeed;
+	T.Throttle = Throttle;
+	T.Rates = CurrentRates;
+	T.AltitudeCm = GetActorLocation().Z;
+	T.GravityScale = FlightMath::GravityScaleAtZ(GetActorLocation().Z, P);
+	T.FallSpeed = FallSpeed;
+	T.Attitude = GetActorRotation();
+	T.FreeLookOffset = FreeLookOffset;
+	T.PredictedImpactSpeed = PredictedImpactSpeed;
+	T.PredictedImpactTime = PredictedImpactTime;
+	T.LastImpactSpeed = LastImpactSpeed;
+	T.CrashElapsed = CrashElapsed;
+	T.bAfterburner = bAfterburnerHeld;
+	T.bFreeLook = bFreeLookHeld;
+	T.bAutoLevel = bAutoLevelHeld;
+	T.bCrashed = bCrashed;
+	T.bImpactPredicted = bImpactPredicted;
+	return T;
 }

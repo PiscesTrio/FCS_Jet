@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "GameFramework/Pawn.h"
 #include "Flight/JetFlightParams.h"
+#include "Flight/JetTelemetry.h"
 #include "FCS_JetPawn.generated.h"
 
 class UCameraComponent;
@@ -122,6 +123,10 @@ public:
 	 */
 	UFUNCTION(BlueprintPure, Category = "Flight")
 	FVector GetAngularRates() const { return CurrentRates; }
+
+	/** One frame of state, gathered for display. */
+	UFUNCTION(BlueprintPure, Category = "Flight")
+	FJetTelemetry GetTelemetry() const { return BuildTelemetry(GetParams()); }
 
 protected:
 	// ---------- Components ----------
@@ -247,16 +252,15 @@ private:
 	void TickTranslation(float DeltaSeconds, const FJetFlightParams& P);
 	void TickCrash(float DeltaSeconds, const FJetFlightParams& P);
 	void TickCamera(float DeltaSeconds, const FJetFlightParams& P);
-	void DrawReadout(const FJetFlightParams& P) const;
+
+	/** Gather this frame's state for the readout. */
+	FJetTelemetry BuildTelemetry(const FJetFlightParams& P) const;
 
 	/** Push the camera and spring arm tunables onto the components. */
 	void ApplyCameraParams(const FJetFlightParams& P);
 
 	/** Push the mesh frame tunables onto the mesh component. */
 	void ApplyMeshParams(const FJetFlightParams& P);
-
-	/** Gravity strength at a given world height: 1 below the ceiling, 0 well above it. */
-	float GetGravityScaleAtZ(float WorldZ, const FJetFlightParams& P) const;
 
 	/** Touched down too slowly to break: kill the descent and slide along the surface. */
 	void TouchDown(const FHitResult& Hit, const FVector& RemainingDelta);
