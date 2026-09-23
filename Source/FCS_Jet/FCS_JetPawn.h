@@ -68,6 +68,33 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Flight")
 	float GetCrashElapsed() const { return bCrashed ? CrashElapsed : 0.f; }
 
+	/** True when the current trajectory runs into something within the warning window. */
+	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
+	bool HasPredictedImpact() const { return bImpactPredicted; }
+
+	/**
+	 * How hard the ship would hit if it held this trajectory, cm/s, measured the same way
+	 * the crash test measures it: the closing speed along the surface normal.
+	 * Zero when nothing is ahead.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
+	float GetPredictedImpactSpeed() const { return PredictedImpactSpeed; }
+
+	/** Seconds until that impact, or 0 when nothing is ahead. */
+	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
+	float GetPredictedImpactTime() const { return PredictedImpactTime; }
+
+	/** True when the predicted impact is hard enough to destroy the ship. */
+	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
+	bool IsPredictedImpactFatal() const
+	{
+		return bImpactPredicted && PredictedImpactSpeed >= MinCrashImpactSpeed;
+	}
+
+	/** Normal speed of the impact that destroyed the ship, cm/s. Kept until the next one. */
+	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
+	float GetLastImpactSpeed() const { return LastImpactSpeed; }
+
 protected:
 	// ---------- Components ----------
 
@@ -160,7 +187,7 @@ protected:
 	 * Below the threshold the ship touches down and slides along the surface.
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.0"))
-	float MinCrashImpactSpeed = 2500.f;
+	float MinCrashImpactSpeed = 4000.f;
 
 	/**
 	 * Radius of the sphere swept along the flight path each frame.
@@ -169,6 +196,14 @@ protected:
 	 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "1.0"))
 	float HullRadius = 300.f;
+
+	/**
+	 * How far ahead the impact readout looks, expressed in seconds of travel at the
+	 * current speed rather than a fixed distance, so the warning arrives with roughly the
+	 * same amount of reaction time whether the ship is crawling or on afterburner.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.1"))
+	float ImpactWarningSeconds = 5.f;
 
 	/** Seconds from impact to respawn. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Crash", meta = (ClampMin = "0.1"))
@@ -340,6 +375,7 @@ private:
 	void TickThrottle(float DeltaSeconds);
 	void TickAttitude(float DeltaSeconds);
 	void TickGravity(float DeltaSeconds);
+	void TickImpactPrediction();
 	void TickTranslation(float DeltaSeconds);
 	void TickCrash(float DeltaSeconds);
 	void TickCamera(float DeltaSeconds);
@@ -382,6 +418,14 @@ private:
 
 	/** Downward speed from gravity, cm/s. Positive means falling. */
 	float FallSpeed = 0.f;
+
+	/** Impact readout, refreshed every frame by TickImpactPrediction. */
+	bool bImpactPredicted = false;
+	float PredictedImpactSpeed = 0.f;
+	float PredictedImpactTime = 0.f;
+
+	/** Normal speed of the last crash, held so the wreck readout can report it. */
+	float LastImpactSpeed = 0.f;
 
 	/** Set between impact and respawn. All flight integration is skipped while true. */
 	bool bCrashed = false;

@@ -323,6 +323,9 @@ void AFCS_JetPawn::Tick(float DeltaSeconds)
 		TickThrottle(DeltaSeconds);
 		TickAttitude(DeltaSeconds);
 		TickGravity(DeltaSeconds);
+		// Predicted before translation so the readout describes the trajectory the ship is
+		// about to fly, not the one it has already committed to this frame.
+		TickImpactPrediction();
 		TickTranslation(DeltaSeconds);
 	}
 
@@ -402,6 +405,44 @@ void AFCS_JetPawn::TickGravity(float DeltaSeconds)
 	}
 }
 
+void AFCS_JetPawn::TickImpactPrediction()
+{
+	bImpactPredicted = false;
+	PredictedImpactSpeed = 0.f;
+	PredictedImpactTime = 0.f;
+
+	if (!GetWorld())
+	{
+		return;
+	}
+
+	const FVector Velocity = GetActorForwardVector() * CurrentSpeed + FVector(0.f, 0.f, -FallSpeed);
+	const float Speed = Velocity.Size();
+	if (Speed <= MinSweepSpeed)
+	{
+		return;
+	}
+
+	const FVector Start = GetActorLocation();
+	const FVector End = Start + Velocity * ImpactWarningSeconds;
+
+	FCollisionQueryParams Params(SCENE_QUERY_STAT(FCSJetImpactPrediction), /*bTraceComplex=*/false);
+	Params.AddIgnoredActor(this);
+
+	FHitResult Hit;
+	if (!GetWorld()->SweepSingleByChannel(
+			Hit, Start, End, FQuat::Identity, ECC_Visibility,
+			FCollisionShape::MakeSphere(HullRadius), Params))
+	{
+		return;
+	}
+
+	bImpactPredicted = true;
+	// Same measure the crash test uses, so the readout and the outcome cannot disagree.
+	PredictedImpactSpeed = FMath::Abs(FVector::DotProduct(Velocity, Hit.ImpactNormal));
+	PredictedImpactTime = (Hit.Distance > 0.f) ? Hit.Distance / Speed : 0.f;
+}
+
 void AFCS_JetPawn::TickTranslation(float DeltaSeconds)
 {
 	// Thrust always points along the nose, with no sideslip and no carried momentum, and
@@ -474,6 +515,11 @@ void AFCS_JetPawn::BeginCrash(const FHitResult& Hit, float ImpactSpeed)
 {
 	bCrashed = true;
 	CrashElapsed = 0.f;
+	LastImpactSpeed = ImpactSpeed;
+
+	bImpactPredicted = false;
+	PredictedImpactSpeed = 0.f;
+	PredictedImpactTime = 0.f;
 
 	CurrentSpeed = 0.f;
 	CurrentRates = FVector::ZeroVector;
@@ -696,11 +742,33 @@ void AFCS_JetPawn::DrawReadout() const
 	if (bCrashed)
 	{
 		GEngine->AddOnScreenDebugMessage(105, 0.f, FColor::Red,
-			FString::Printf(TEXT("GROUND IMPACT  -  respawn in %.1f s"),
+			FString::Printf(TEXT("GROUND IMPACT  %.0f km/h  -  respawn in %.1f s"),
+				LastImpactSpeed * CmsToKmh,
 				FMath::Max(0.f, RespawnDelay - CrashElapsed)));
+		GEngine->RemoveOnScreenDebugMessage(107);
 	}
 	else
 	{
 		GEngine->RemoveOnScreenDebugMessage(105);
+
+		// The number that decides the outcome, live, next to the threshold it is judged
+		// against. Reporting it only after the fact would be useless for staying alive.
+		if (bImpactPredicted)
+		{
+			const bool bFatal = PredictedImpactSpeed >= MinCrashImpactSpeed;
+			GEngine->AddOnScreenDebugMessage(107, 0.f,
+				bFatal ? FColor::Red : FColor::Green,
+				FString::Printf(TEXT("IMPACT %5.0f km/h in %4.1f s   limit %.0f   %s"),
+					PredictedImpactSpeed * CmsToKmh,
+					PredictedImpactTime,
+					MinCrashImpactSpeed * CmsToKmh,
+					bFatal ? TEXT("FATAL") : TEXT("survivable")));
+		}
+		else
+		{
+			GEngine->AddOnScreenDebugMessage(107, 0.f, FColor::Silver,
+				FString::Printf(TEXT("IMPACT     -              limit %.0f   clear"),
+					MinCrashImpactSpeed * CmsToKmh));
+		}
 	}
 }
