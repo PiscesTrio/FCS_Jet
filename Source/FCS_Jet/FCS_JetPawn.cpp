@@ -155,6 +155,8 @@ AFCS_JetPawn::AFCS_JetPawn()
 		TEXT("/Game/FCS_Jet/Input/IA_Throttle.IA_Throttle"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> AfterburnerAsset(
 		TEXT("/Game/FCS_Jet/Input/IA_Afterburner.IA_Afterburner"));
+	static ConstructorHelpers::FObjectFinder<UInputAction> AutoLevelAsset(
+		TEXT("/Game/FCS_Jet/Input/IA_AutoLevel.IA_AutoLevel"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> FreeLookAsset(
 		TEXT("/Game/FCS_Jet/Input/IA_FreeLook.IA_FreeLook"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> LookAsset(
@@ -168,6 +170,7 @@ AFCS_JetPawn::AFCS_JetPawn()
 	YawAction = YawAsset.Succeeded() ? YawAsset.Object : nullptr;
 	ThrottleAction = ThrottleAsset.Succeeded() ? ThrottleAsset.Object : nullptr;
 	AfterburnerAction = AfterburnerAsset.Succeeded() ? AfterburnerAsset.Object : nullptr;
+	AutoLevelAction = AutoLevelAsset.Succeeded() ? AutoLevelAsset.Object : nullptr;
 	FreeLookAction = FreeLookAsset.Succeeded() ? FreeLookAsset.Object : nullptr;
 	LookAction = LookAsset.Succeeded() ? LookAsset.Object : nullptr;
 	LookStickAction = LookStickAsset.Succeeded() ? LookStickAsset.Object : nullptr;
@@ -282,6 +285,12 @@ void AFCS_JetPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 		EIC->BindAction(AfterburnerAction, ETriggerEvent::Completed, this, &AFCS_JetPawn::OnAfterburnerStop);
 		EIC->BindAction(AfterburnerAction, ETriggerEvent::Canceled, this, &AFCS_JetPawn::OnAfterburnerStop);
 	}
+	if (AutoLevelAction)
+	{
+		EIC->BindAction(AutoLevelAction, ETriggerEvent::Triggered, this, &AFCS_JetPawn::OnAutoLevelStart);
+		EIC->BindAction(AutoLevelAction, ETriggerEvent::Completed, this, &AFCS_JetPawn::OnAutoLevelStop);
+		EIC->BindAction(AutoLevelAction, ETriggerEvent::Canceled, this, &AFCS_JetPawn::OnAutoLevelStop);
+	}
 	if (FreeLookAction)
 	{
 		EIC->BindAction(FreeLookAction, ETriggerEvent::Triggered, this, &AFCS_JetPawn::OnFreeLookStart);
@@ -316,6 +325,8 @@ void AFCS_JetPawn::OnThrottleReleased() { ThrottleInput = 0.f; }
 
 void AFCS_JetPawn::OnAfterburnerStart() { bAfterburnerHeld = true; }
 void AFCS_JetPawn::OnAfterburnerStop() { bAfterburnerHeld = false; }
+void AFCS_JetPawn::OnAutoLevelStart() { bAutoLevelHeld = true; }
+void AFCS_JetPawn::OnAutoLevelStop() { bAutoLevelHeld = false; }
 void AFCS_JetPawn::OnFreeLookStart() { bFreeLookHeld = true; }
 void AFCS_JetPawn::OnFreeLookStop() { bFreeLookHeld = false; }
 
@@ -379,7 +390,27 @@ void AFCS_JetPawn::TickAttitude(float DeltaSeconds)
 {
 	// There are no aerodynamic moments, so the entire handling character lives in this
 	// one interpolation.
-	const FVector TargetRates(PitchInput * PitchRate, YawInput * YawRate, RollInput * RollRate);
+	FVector TargetRates(PitchInput * PitchRate, YawInput * YawRate, RollInput * RollRate);
+
+	if (bAutoLevelHeld)
+	{
+		// Level means wings level and nose on the horizon. Yaw is deliberately left with
+		// the player: which way the ship points is their intent, not something to take
+		// away while they are only asking to stop tumbling.
+		//
+		// The correction is proportional on the pitch and roll angles rather than a
+		// quaternion shortest arc. The two are coupled while banked, but roll is the far
+		// faster axis here, so it wins the race and the pitch term becomes accurate as
+		// the wings come level. Convergence from inverted and from near vertical is
+		// measured rather than assumed.
+		const FRotator Current = GetActorRotation();
+		const float PitchError = FRotator::NormalizeAxis(-Current.Pitch);
+		const float RollError = FRotator::NormalizeAxis(-Current.Roll);
+
+		TargetRates.X = FMath::Clamp(PitchError * AutoLevelGain, -PitchRate, PitchRate);
+		TargetRates.Z = FMath::Clamp(RollError * AutoLevelGain, -RollRate, RollRate);
+	}
+
 	CurrentRates = FMath::VInterpTo(CurrentRates, TargetRates, DeltaSeconds, ControlInterpSpeed);
 
 	const FRotator DeltaRotation(
@@ -771,6 +802,18 @@ void AFCS_JetPawn::DrawReadout() const
 	else
 	{
 		GEngine->RemoveOnScreenDebugMessage(104);
+	}
+
+	if (bAutoLevelHeld)
+	{
+		const FRotator Now = GetActorRotation();
+		GEngine->AddOnScreenDebugMessage(108, 0.f, FColor::Orange,
+			FString::Printf(TEXT("AUTO-LEVEL   pitch %+5.1f   roll %+6.1f"),
+				FRotator::NormalizeAxis(Now.Pitch), FRotator::NormalizeAxis(Now.Roll)));
+	}
+	else
+	{
+		GEngine->RemoveOnScreenDebugMessage(108);
 	}
 
 	if (bCrashed)

@@ -95,6 +95,20 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Flight|Impact")
 	float GetLastImpactSpeed() const { return LastImpactSpeed; }
 
+	/** True while the level-off button is held. */
+	UFUNCTION(BlueprintPure, Category = "Flight")
+	bool IsAutoLevelling() const { return bAutoLevelHeld; }
+
+	/**
+	 * Commanded body angular rates in degrees per second: X pitch, Y yaw, Z roll.
+	 *
+	 * Exposed because the Euler angle derivative is not a sound proxy for it. The two
+	 * axes are coupled while banked, so differentiating the attitude readout can report a
+	 * rate well above what was actually commanded.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Flight")
+	FVector GetAngularRates() const { return CurrentRates; }
+
 protected:
 	// ---------- Components ----------
 
@@ -285,6 +299,18 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "0.1"))
 	float ControlInterpSpeed = 5.f;
 
+	/**
+	 * Proportional gain for the level-off, in commanded degrees per second per degree of
+	 * error. 2.5 means a 60 degree bank asks for 150 deg/s, which the roll limit then
+	 * clips to 140, so the correction runs at full rate until the last 56 degrees and
+	 * eases in from there.
+	 *
+	 * The commanded rate is clamped to the same PitchRate and RollRate the player gets,
+	 * so levelling can never out-turn the ship's own handling.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flight|Handling", meta = (ClampMin = "0.1"))
+	float AutoLevelGain = 2.5f;
+
 	// ---------- Camera ----------
 
 	/** Mouse free look gain. The mouse reports a delta, so this is not a rate. */
@@ -346,6 +372,9 @@ protected:
 	TObjectPtr<UInputAction> AfterburnerAction;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> AutoLevelAction;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> FreeLookAction;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
@@ -383,6 +412,8 @@ private:
 
 	void OnAfterburnerStart();
 	void OnAfterburnerStop();
+	void OnAutoLevelStart();
+	void OnAutoLevelStop();
 	void OnFreeLookStart();
 	void OnFreeLookStop();
 
@@ -425,6 +456,7 @@ private:
 
 	bool bAfterburnerHeld = false;
 	bool bFreeLookHeld = false;
+	bool bAutoLevelHeld = false;
 
 	/** Throttle setting, 0..1. Holds its value when the key is released. */
 	float Throttle = 0.35f;
