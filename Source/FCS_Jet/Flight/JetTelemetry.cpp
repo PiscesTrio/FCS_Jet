@@ -97,6 +97,15 @@ void Draw(const FJetTelemetry& T, const FJetFlightParams& P)
 
 	GEngine->RemoveOnScreenDebugMessage(KeyCrash);
 
+	if (!T.bCrashArmed)
+	{
+		// Said plainly rather than left blank. A quiet impact line would otherwise look
+		// like a clear path right up until the ship flies through the deck.
+		GEngine->AddOnScreenDebugMessage(KeyImpact, 0.f, FColor::Magenta,
+			TEXT("IMPACT   DISARMED  -  ground impacts off"));
+		return;
+	}
+
 	// The number that decides the outcome, live, next to the threshold it is judged
 	// against. Reporting it only after the fact would be useless for staying alive.
 	if (T.bImpactPredicted)

@@ -74,6 +74,10 @@ struct FCS_JET_API FJetTelemetry
 
 	UPROPERTY(BlueprintReadOnly, Category = "Telemetry")
 	bool bImpactPredicted = false;
+
+	/** Whether ground impacts are live. */
+	UPROPERTY(BlueprintReadOnly, Category = "Telemetry")
+	bool bCrashArmed = true;
 };
 
 namespace JetReadout

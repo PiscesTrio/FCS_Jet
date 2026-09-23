@@ -127,6 +127,8 @@ AFCS_JetPawn::AFCS_JetPawn()
 		TEXT("/Game/FCS_Jet/Input/IA_Afterburner.IA_Afterburner"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> AutoLevelAsset(
 		TEXT("/Game/FCS_Jet/Input/IA_AutoLevel.IA_AutoLevel"));
+	static ConstructorHelpers::FObjectFinder<UInputAction> ToggleCrashAsset(
+		TEXT("/Game/FCS_Jet/Input/IA_ToggleCrash.IA_ToggleCrash"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> FreeLookAsset(
 		TEXT("/Game/FCS_Jet/Input/IA_FreeLook.IA_FreeLook"));
 	static ConstructorHelpers::FObjectFinder<UInputAction> LookAsset(
@@ -141,6 +143,7 @@ AFCS_JetPawn::AFCS_JetPawn()
 	ThrottleAction = ThrottleAsset.Succeeded() ? ThrottleAsset.Object : nullptr;
 	AfterburnerAction = AfterburnerAsset.Succeeded() ? AfterburnerAsset.Object : nullptr;
 	AutoLevelAction = AutoLevelAsset.Succeeded() ? AutoLevelAsset.Object : nullptr;
+	ToggleCrashAction = ToggleCrashAsset.Succeeded() ? ToggleCrashAsset.Object : nullptr;
 	FreeLookAction = FreeLookAsset.Succeeded() ? FreeLookAsset.Object : nullptr;
 	LookAction = LookAsset.Succeeded() ? LookAsset.Object : nullptr;
 	LookStickAction = LookStickAsset.Succeeded() ? LookStickAsset.Object : nullptr;
@@ -234,6 +237,7 @@ void AFCS_JetPawn::BeginPlay()
 	// The constructor could only reach DefaultParams. Now that the Tuning asset is
 	// resolved, push the real values onto the components.
 	const FJetFlightParams& P = GetParams();
+	bCrashArmed = P.bCrashEnabled;
 	ApplyMeshParams(P);
 	ApplyCameraParams(P);
 	if (Camera)
@@ -307,6 +311,12 @@ void AFCS_JetPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputCompone
 		EIC->BindAction(AutoLevelAction, ETriggerEvent::Completed, this, &AFCS_JetPawn::OnAutoLevelStop);
 		EIC->BindAction(AutoLevelAction, ETriggerEvent::Canceled, this, &AFCS_JetPawn::OnAutoLevelStop);
 	}
+	if (ToggleCrashAction)
+	{
+		// Started rather than Triggered: this is a press, and Triggered would fire every
+		// frame the key is down and flip the state back and forth.
+		EIC->BindAction(ToggleCrashAction, ETriggerEvent::Started, this, &AFCS_JetPawn::OnToggleCrash);
+	}
 	if (FreeLookAction)
 	{
 		EIC->BindAction(FreeLookAction, ETriggerEvent::Triggered, this, &AFCS_JetPawn::OnFreeLookStart);
@@ -343,6 +353,13 @@ void AFCS_JetPawn::OnAfterburnerStart() { bAfterburnerHeld = true; }
 void AFCS_JetPawn::OnAfterburnerStop() { bAfterburnerHeld = false; }
 void AFCS_JetPawn::OnAutoLevelStart() { bAutoLevelHeld = true; }
 void AFCS_JetPawn::OnAutoLevelStop() { bAutoLevelHeld = false; }
+void AFCS_JetPawn::OnToggleCrash()
+{
+	bCrashArmed = !bCrashArmed;
+	UE_LOG(LogTemp, Log, TEXT("[FCS_Jet] Ground impacts %s."),
+		bCrashArmed ? TEXT("armed") : TEXT("disarmed"));
+}
+
 void AFCS_JetPawn::OnFreeLookStart() { bFreeLookHeld = true; }
 void AFCS_JetPawn::OnFreeLookStop() { bFreeLookHeld = false; }
 
@@ -449,7 +466,8 @@ void AFCS_JetPawn::TickImpactPrediction(const FJetFlightParams& P)
 	PredictedImpactSpeed = 0.f;
 	PredictedImpactTime = 0.f;
 
-	if (!GetWorld())
+	// Nothing to warn about while impacts are disarmed, and the trace would be wasted.
+	if (!bCrashArmed || !GetWorld())
 	{
 		return;
 	}
@@ -490,7 +508,7 @@ void AFCS_JetPawn::TickTranslation(float DeltaSeconds, const FJetFlightParams& P
 	// collision on the hull and using swept movement. Swept movement would leave the ship
 	// resting against, and frequently wedged into, whatever it touched; here the hit is
 	// only ever a trigger and the response is entirely ours.
-	if (P.bCrashEnabled && Velocity.Size() > P.MinSweepSpeed && GetWorld())
+	if (bCrashArmed && Velocity.Size() > P.MinSweepSpeed && GetWorld())
 	{
 		const FVector Start = GetActorLocation();
 		const FVector End = Start + Delta;
@@ -727,5 +745,6 @@ FJetTelemetry AFCS_JetPawn::BuildTelemetry(const FJetFlightParams& P) const
 	T.bAutoLevel = bAutoLevelHeld;
 	T.bCrashed = bCrashed;
 	T.bImpactPredicted = bImpactPredicted;
+	T.bCrashArmed = bCrashArmed;
 	return T;
 }

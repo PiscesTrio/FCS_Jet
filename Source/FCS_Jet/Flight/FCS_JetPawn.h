@@ -115,6 +115,16 @@ public:
 	bool IsAutoLevelling() const { return bAutoLevelHeld; }
 
 	/**
+	 * Whether ground impacts are live.
+	 *
+	 * Toggled in flight. The tuning asset's bCrashEnabled only decides what this starts
+	 * as: a key must not write to a shared asset, which would both persist the change and
+	 * apply it to anything else pointing at the same tuning.
+	 */
+	UFUNCTION(BlueprintPure, Category = "Flight")
+	bool IsCrashArmed() const { return bCrashArmed; }
+
+	/**
 	 * Commanded body angular rates in degrees per second: X pitch, Y yaw, Z roll.
 	 *
 	 * Exposed because the Euler angle derivative is not a sound proxy for it. The two
@@ -196,6 +206,10 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> AutoLevelAction;
 
+	/** Pressed, not held: arms or disarms ground impacts. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<UInputAction> ToggleCrashAction;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<UInputAction> FreeLookAction;
 
@@ -236,6 +250,7 @@ private:
 	void OnAfterburnerStop();
 	void OnAutoLevelStart();
 	void OnAutoLevelStop();
+	void OnToggleCrash();
 	void OnFreeLookStart();
 	void OnFreeLookStop();
 
@@ -296,6 +311,9 @@ private:
 	bool bAfterburnerHeld = false;
 	bool bFreeLookHeld = false;
 	bool bAutoLevelHeld = false;
+
+	/** Live state of the crash toggle, seeded from the params at BeginPlay. */
+	bool bCrashArmed = true;
 
 	/** Throttle setting, 0..1. Holds its value when the key is released. */
 	float Throttle = 0.35f;
