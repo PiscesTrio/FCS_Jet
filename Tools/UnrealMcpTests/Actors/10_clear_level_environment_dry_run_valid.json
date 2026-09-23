@@ -1,0 +1,27 @@
+{
+  "name": "clear_level_environment_dry_run_valid",
+  "description": "Level actor dry-run path should report targets without deleting actors.",
+  "category": "happy_path",
+  "expectToolListed": true,
+  "executeTool": true,
+  "expectToolCallError": false,
+  "expectToolCallStructuredFields": {
+    "dryRun": true,
+    "preflight.evaluatedBeforeExecution": true,
+    "preflight.checkLevel": "tool_specific_preflight",
+    "postcheck.checkLevel": "tool_specific_state"
+  },
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 301,
+    "method": "tools/call",
+    "params": {
+      "name": "unreal.clear_level_environment",
+      "arguments": {
+        "dryRun": true,
+        "filter": "UEvolveMcpSmokeNonexistent",
+        "limit": 10
+      }
+    }
+  }
+}

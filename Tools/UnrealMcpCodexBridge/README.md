@@ -1,0 +1,322 @@
+# UEAtelier Codex Bridge
+
+This is the P7.A bridge daemon between the Codex App Server protocol and the
+simple WebSocket API that the Unreal plugin will consume in P7.B.
+
+The bridge starts its own `codex app-server` subprocess, connects to it over a
+platform-selected transport, initializes the App Server protocol, creates one
+Codex thread, then listens for UE-facing WebSocket messages on:
+
+```text
+ws://127.0.0.1:8766/uevolve
+```
+
+## Wire Framing Decision
+
+Tested clients:
+
+```text
+codex-cli 0.130.0 - original wire-framing probe
+codex-cli 0.132.0 / rmcp 0.15 - current verified line; strict untagged-result parsing rejects non-spec result keys
+```
+
+Codex Desktop auto-updates the CLI, so re-verify this matrix after Codex
+updates with `codex --version`.
+
+The Unix listener created by:
+
+```bash
+codex app-server --listen unix:///tmp/uevolve-codex/srv.sock
+```
+
+is not raw newline JSON, LSP `Content-Length`, 4-byte length-prefixed JSON, or
+concatenated JSON. Direct `net.connect()` attempts with those four framings were
+closed by the server with zero response bytes.
+
+The open-source Codex transport implementation confirms the `unix://` listener
+is a WebSocket upgrade endpoint over a Unix domain socket. After the HTTP
+WebSocket upgrade, each App Server JSON message is one WebSocket text frame. The
+payload is the lightweight Codex JSON-RPC object:
+
+```json
+{"id":"1","method":"initialize","params":{...}}
+```
+
+Codex does not send or require the standard `jsonrpc:"2.0"` field. For stdio,
+the same JSON object is newline-delimited; for Unix sockets, it is WebSocket text
+framed. The probe log with raw bytes and successful streaming text is written to:
+
+```text
+/tmp/uevolve-codex-bridge-spike.log
+```
+
+## Start
+
+From the repository root:
+
+```bash
+bun run --cwd Tools/UnrealMcpCodexBridge src/index.ts
+```
+
+Or from the bridge directory on macOS/Linux:
+
+```bash
+./start-bridge.sh
+```
+
+On Windows, use either launcher from the repository root:
+
+```cmd
+Tools\UnrealMcpCodexBridge\start-bridge.cmd
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File Tools\UnrealMcpCodexBridge\start-bridge.ps1
+```
+
+Expected startup output:
+
+```text
+Registered unrealmcp in /Users/<you>/.codex/config.toml
+Codex binary: /opt/homebrew/bin/codex
+Registered MCP server 'unrealmcp' with Codex; the model is instructed to use it via mcpServer/tool/call.
+UEAtelier Codex Bridge listening at ws://127.0.0.1:8766/uevolve
+Codex app-server transport=unix endpoint=/tmp/uevolve-codex-bridge-<id>/codex.sock
+Codex app-server args: app-server --listen unix:///tmp/.../codex.sock -c mcp_servers.unrealmcp.url="http://127.0.0.1:8765/mcp" -c mcp_servers.unrealmcp.transport="streamable-http"
+MCP registration: {"enabled":true,"name":"unrealmcp","url":"http://127.0.0.1:8765/mcp"}
+MCP status: not queried at bridge startup; Codex verifies tools lazily from native config during turns
+Codex defaults model=gpt-5.5 effort=xhigh approvalPolicy=reject sandbox=workspace-write log=/tmp/uevolve-codex-bridge-<pid>.log
+```
+
+Stop with `Ctrl-C`. On shutdown, the bridge interrupts any in-flight Codex turn,
+closes connected WebSocket clients, and terminates its spawned app-server
+subprocess.
+
+## Platform Support
+
+The bridge defaults to Unix-domain sockets on macOS and Linux:
+
+```text
+codex app-server --listen unix://<tmpdir>/codex.sock
+```
+
+On Windows, it defaults to stdio because current Codex App Server builds reject
+`--listen ws://127.0.0.1:<port>`:
+
+```text
+codex app-server --listen stdio://
+```
+
+The bridge resolves the Codex binary before spawning:
+
+- `UEVOLVE_CODEX_BIN` wins when set. It must be an absolute path to
+  `codex.exe`, `codex.cmd`, or the POSIX `codex` binary.
+- On Windows, the bridge first checks
+  `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe` and prefers that user-mode
+  install location over the WindowsApps packaged binary.
+- Otherwise the bridge runs `where codex` on Windows or `which codex` on
+  macOS/Linux and uses the first usable result.
+- WindowsApps `codex.exe` paths under `C:\Program Files\WindowsApps\` are
+  skipped because Bun cannot spawn them reliably; install user-mode Codex or
+  set `UEVOLVE_CODEX_BIN`.
+- If the resolved Windows path ends in `.cmd` or `.bat`, the bridge starts
+  Codex in shell mode so `cmd.exe` can interpret the npm shim. The startup log
+  marks this as `shell mode for Windows shim`.
+- The Windows launchers automatically use `runtime\bun.exe` when it is bundled
+  with the bridge, before falling back to `bun` on PATH.
+
+If a firewall or local policy requires a stable Codex App Server port, set
+`UEVOLVE_CODEX_APP_SERVER_PORT` and select `UEVOLVE_CODEX_TRANSPORT=ws`.
+
+## Configuration
+
+Environment variables:
+
+```text
+UEVOLVE_CODEX_BRIDGE_PORT=8766
+UEVOLVE_CODEX_BRIDGE_PATH=/uevolve
+UEVOLVE_CODEX_CWD=<working directory for Codex turns; default is repo root>
+UEVOLVE_CODEX_MODEL=gpt-5.5
+UEVOLVE_CODEX_EFFORT=xhigh
+UEVOLVE_CODEX_BIN=<absolute path to codex.exe/codex.cmd/codex>
+UEVOLVE_CODEX_APPROVAL_POLICY=reject|auto-approve
+UEVOLVE_CODEX_TRANSPORT=ws|unix|stdio
+UEVOLVE_CODEX_APP_SERVER_PORT=<port for ws transport; default is auto>
+UEVOLVE_MCP_NAME=unrealmcp
+UEVOLVE_MCP_URL=http://127.0.0.1:8765/mcp
+UEVOLVE_DISABLE_AUTO_MCP_REGISTER=1
+UEVOLVE_MCP_BEARER=<future UE MCP bearer token>
+```
+
+`UEVOLVE_CODEX_TRANSPORT` overrides the OS default on any platform. `ws` uses
+`ws://127.0.0.1:<port>`; `unix` uses a temporary Unix-domain socket; `stdio`
+uses newline-delimited App Server JSON on the child process stdin/stdout. When
+`UEVOLVE_CODEX_APP_SERVER_PORT` is unset for `ws`, the bridge briefly binds
+`127.0.0.1:0` to discover a free port, closes that probe listener, then starts
+Codex App Server on the selected port.
+
+The bridge daemon defaults are:
+
+```text
+model: gpt-5.5
+reasoning effort: xhigh
+thread approvalPolicy: on-request
+thread sandbox: workspace-write
+```
+
+Override the defaults with `UEVOLVE_CODEX_MODEL` and
+`UEVOLVE_CODEX_EFFORT`. `UEVOLVE_CODEX_EFFORT` must be one of `low`,
+`medium`, `high`, or `xhigh`. UE-facing `start_turn` messages can also send
+per-turn `model` and `effort` fields; if omitted, the daemon defaults are used.
+The separate Codex CLI subprocess provider in the UE plugin is not affected and
+remains locked for autonomous orchestration.
+
+`workspace-write` is the narrowest App Server sandbox mode above `read-only`.
+It is used so the app-server can load and call the local HTTP MCP server, while
+the bridge approval handler still denies Codex's built-in file, shell, and
+permission paths.
+
+The daemon writes all App Server JSON sent and received to:
+
+```text
+/tmp/uevolve-codex-bridge-<pid>.log
+```
+
+## MCP Tool Bridging
+
+By default, the bridge starts Codex with the running Unreal MCP endpoint
+registered as an App Server MCP server:
+
+```bash
+codex app-server --listen <unix-or-ws-endpoint> \
+  -c mcp_servers.unrealmcp.url="http://127.0.0.1:8765/mcp" \
+  -c mcp_servers.unrealmcp.transport="streamable-http"
+```
+
+That streamable HTTP registration makes Codex see the Unreal tool inventory, including tools such as
+`unreal.editor_status`, `unreal.execute_python`, `unreal.spawn_actor`, and the
+self-extension `unreal.mcp_*` tools exposed by the editor.
+The bridge thread instructions direct Codex to call this registered MCP server
+through native `mcpServer/tool/call` routing instead of shell commands, `curl`,
+or direct HTTP requests.
+
+Override the registration with:
+
+```text
+UEVOLVE_MCP_NAME=<config key; default unrealmcp>
+UEVOLVE_MCP_URL=<HTTP MCP endpoint; default http://127.0.0.1:8765/mcp>
+UEVOLVE_DISABLE_AUTO_MCP_REGISTER=1
+```
+
+If the Unreal MCP endpoint later enables bearer authentication, set:
+
+```text
+UEVOLVE_MCP_BEARER=<token>
+```
+
+The bridge passes that value as
+`mcp_servers.<name>.bearer_token="<token>"`. Be aware that command-line
+configuration can be visible in process listings on local development machines.
+
+Codex CLI 0.130.0 `codex mcp add --help` exposes HTTP URL and bearer-token
+configuration, but it does not expose a per-server `trusted` or `auto_approve`
+field. The bridge therefore does not set one. Unreal MCP tool execution is
+delegated to the UE MCP server, whose audit, dry-run, backup, test, and rollback
+layers own Unreal-side safety.
+
+## UE-Facing WebSocket Protocol
+
+Client to bridge:
+
+```json
+{"type":"start_turn","requestId":"<uuid>","prompt":"...","context":"optional","model":"optional","effort":"optional"}
+{"type":"cancel","requestId":"<uuid>"}
+{"type":"steer","requestId":"<uuid>","instruction":"..."}
+```
+
+`model` must match `/^[a-zA-Z0-9._\-]{1,64}$/` when provided. `effort` must be
+one of `low`, `medium`, `high`, or `xhigh`. Invalid values receive an `error`
+message and do not start a Codex turn.
+
+Bridge to client:
+
+```json
+{"type":"health","state":"ready"}
+{"type":"text_delta","requestId":"<uuid>","text":"..."}
+{"type":"tool_started","requestId":"<uuid>","toolName":"...","toolCallId":"...","args":{}}
+{"type":"tool_finished","requestId":"<uuid>","toolCallId":"...","text":"...","isError":false}
+{"type":"turn_complete","requestId":"<uuid>","fullText":"..."}
+{"type":"error","requestId":"<uuid>","message":"..."}
+```
+
+## Approval Policy
+
+Default policy is `reject`. `auto-approve` is retained as an operator label for
+compatibility, but built-in OS-level capabilities are rejected in both modes.
+
+The bridge rejects or withholds all Codex requests that would write files, run
+commands, change permissions, request user input, or elicit external MCP input:
+
+```text
+applyPatchApproval
+execCommandApproval
+item/commandExecution/requestApproval
+item/fileChange/requestApproval
+item/permissions/requestApproval
+mcpServer/elicitation/request
+item/tool/requestUserInput
+item/tool/call
+```
+
+Codex CLI 0.130.0 routes MCP tool-call confirmation through
+`mcpServer/elicitation/request` with `_meta.codex_approval_kind` set to
+`mcp_tool_call`. The bridge accepts only that narrow MCP tool-call approval when
+`serverName` matches `UEVOLVE_MCP_NAME`; all other MCP elicitations remain
+declined.
+
+This is intentional for the Unreal workflow: Codex should mutate the Unreal
+project through MCP tools, not through raw shell commands or direct file edits.
+
+## Smoke Test
+
+With the daemon running:
+
+```bash
+bun run --cwd Tools/UnrealMcpCodexBridge test-client.ts
+```
+
+The test client connects to `ws://127.0.0.1:8766/uevolve`, sends:
+
+```text
+List three Unreal Engine 5 actor classes
+```
+
+and exits with code `0` when it receives a non-empty `turn_complete.fullText`.
+A captured smoke transcript is available at:
+
+```text
+/tmp/uevolve-codex-bridge-smoke.log
+```
+
+To verify direct Unreal MCP tool use with the editor running:
+
+```bash
+bun run --cwd Tools/UnrealMcpCodexBridge test-mcp-roundtrip.ts
+```
+
+The roundtrip test asks Codex to call `unreal.editor_status`, requires matching
+`tool_started` and `tool_finished` bridge events, and exits with code `0` only
+after a non-empty `turn_complete`.
+
+## Known Limitations
+
+- On startup, the bridge ensures `~/.codex/config.toml` contains
+  `[mcp_servers.unrealmcp]` pointing at the Unreal Editor MCP endpoint, so Codex
+  CLI, Codex Desktop GUI, and bridge-spawned sessions all discover the server
+  natively through Codex config. The block is auto-managed; manual edits are
+  refreshed on the next bridge start. Verify with `codex mcp list`.
+- The bridge does not auto-restart the app-server subprocess. If Codex exits,
+  health becomes `failed`.
+- V1 supports one active turn at a time on the cached thread.
+- The bridge requires a running Unreal Editor with the Unreal MCP plugin loaded
+  before MCP tool calls can succeed.

@@ -1,0 +1,38 @@
+# ---- UE generated output, ignored at any depth (project root and each plugin) ----
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+
+# ---- Packaged builds ----
+Packaged/
+
+# ---- File open order logs emitted by the cooker, regenerated on demand ----
+Build/*/FileOpenOrder/
+
+# ---- IDE and solution files, rebuilt by Generate Project Files ----
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.sdf
+*.opensdf
+*.opendb
+*.VC.db
+*.VC.opendb
+*.xcodeproj
+*.xcworkspace
+
+# ---- Python caches ----
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- Local rollback backups ----
+*.bak
+*.bak-*
+
+# ---- OS cruft ----
+.DS_Store
+Thumbs.db

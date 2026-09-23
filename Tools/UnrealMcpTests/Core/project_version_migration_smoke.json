@@ -1,0 +1,24 @@
+{
+  "name": "project_version_migration_smoke",
+  "description": "Dry-run smoke for previewing a primary UE 5.8 EngineAssociation change without writing the project file.",
+  "category": "happy_path",
+  "expectToolListed": true,
+  "executeTool": true,
+  "expectToolCallError": false,
+  "expectToolCallStructuredFields": {
+    "targetSupportTier": "primary",
+    "dryRun": true
+  },
+  "request": {
+    "jsonrpc": "2.0",
+    "id": 140,
+    "method": "tools/call",
+    "params": {
+      "name": "unreal.project_version_migration",
+      "arguments": {
+        "targetEngineVersion": "5.8",
+        "dryRun": true
+      }
+    }
+  }
+}

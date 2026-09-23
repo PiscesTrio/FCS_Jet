@@ -1,0 +1,188 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { approvalModeFromEnv } from "./approval-policy";
+import { ensureUnrealMcpServerRegistered } from "./codex-config";
+import { CodexStdioClient, CodexWsClient, startCodexAppServer, waitForEndpoint } from "./codex-protocol";
+import { createBridgeServer, send, type HealthState } from "./server";
+
+const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
+const cwd = process.env.UEVOLVE_CODEX_CWD ?? projectRoot;
+const port = Number(process.env.UEVOLVE_CODEX_BRIDGE_PORT ?? 8766);
+const wsPath = process.env.UEVOLVE_CODEX_BRIDGE_PATH ?? "/uevolve";
+const defaultModel = requireValidModel(envDefault("UEVOLVE_CODEX_MODEL", "gpt-5.5"), "UEVOLVE_CODEX_MODEL");
+const defaultEffort = requireValidEffort(envDefault("UEVOLVE_CODEX_EFFORT", "xhigh"), "UEVOLVE_CODEX_EFFORT");
+const unrealMcpUrl = process.env.UEVOLVE_MCP_URL ?? "http://127.0.0.1:8765/mcp";
+const codexApprovalPolicy = "on-request";
+const sandbox = "workspace-write";
+const approvalMode = approvalModeFromEnv();
+const logPath = path.join(os.tmpdir(), `uevolve-codex-bridge-${process.pid}.log`);
+let health: { state: HealthState; reason?: string } = { state: "starting" };
+let threadId = "";
+let codex: CodexStdioClient | CodexWsClient;
+const active = new Map<string, { requestId: string; ws: any; turnId: string; fullText: string }>();
+
+function log(direction: string, payload: any): void {
+  fs.appendFileSync(logPath, `${new Date().toISOString()} ${direction} ${JSON.stringify(payload)}\n`);
+}
+
+const codexConfig = await ensureUnrealMcpServerRegistered({ url: unrealMcpUrl });
+console.log(`${codexConfig.wroteFile ? "Registered unrealmcp in" : "unrealmcp already current in"} ${codexConfig.path}`);
+
+const child = await startCodexAppServer((reason) => {
+  health = { state: "failed", reason };
+  console.error(reason);
+});
+if (child.transport !== "stdio") child.proc.stdout.on("data", (chunk) => process.stdout.write(`[codex] ${chunk}`));
+child.proc.stderr.on("data", (chunk) => process.stderr.write(`[codex] ${chunk}`));
+console.log(`Codex binary: ${child.codexBin}${child.shellMode ? " (shell mode for Windows shim)" : ""}`);
+for (const warning of child.warnings) console.warn(`Codex discovery warning: ${JSON.stringify(warning)}`);
+
+function onNotification(message: any): void {
+  const params = message.params ?? {};
+  const turnId = params.turnId ?? params.turn?.id;
+  const record = turnId ? active.get(turnId) : undefined;
+  if (message.method === "item/agentMessage/delta" && record) {
+    record.fullText += params.delta ?? "";
+    send(record.ws, { type: "text_delta", requestId: record.requestId, text: params.delta ?? "" });
+  } else if (message.method === "item/started" && record) {
+    const item = params.item ?? {};
+    if (isToolItem(item)) send(record.ws, { type: "tool_started", requestId: record.requestId, toolName: toolName(item), toolCallId: item.id, args: toolArgs(item) });
+  } else if (message.method === "item/completed" && record) {
+    const item = params.item ?? {};
+    if (isToolItem(item)) send(record.ws, { type: "tool_finished", requestId: record.requestId, toolCallId: item.id, text: toolText(item), isError: toolError(item) });
+  } else if (message.method === "turn/completed" && record) {
+    const fullText = record.fullText || extractFinalText(params.turn);
+    send(record.ws, { type: "turn_complete", requestId: record.requestId, fullText });
+    active.delete(record.turnId);
+  } else if (message.method === "error") {
+    for (const record of active.values()) send(record.ws, { type: "error", requestId: record.requestId, message: params.message ?? JSON.stringify(params) });
+  }
+}
+
+await waitForEndpoint(child.endpoint, child.transport);
+codex = child.transport === "stdio" ? new CodexStdioClient(child.proc, log, approvalMode, onNotification) : new CodexWsClient(child.endpoint, log, approvalMode, onNotification);
+if (codex instanceof CodexStdioClient) {
+  codex.onError((error) => {
+    health = { state: "failed", reason: error.message };
+    console.error(error.message);
+  });
+}
+await codex.connect();
+await codex.initialize();
+const started = await codex.request("thread/start", {
+  model: defaultModel,
+  cwd,
+  approvalPolicy: codexApprovalPolicy,
+  sandbox,
+  config: { model_reasoning_effort: defaultEffort },
+  ephemeral: true,
+  sessionStartSource: "startup",
+  developerInstructions: developerInstructions(child.mcpRegistration.name),
+});
+threadId = started.thread.id;
+health = { state: "ready" };
+console.log(`Registered MCP server '${child.mcpRegistration.name}' with Codex; the model is instructed to use it via mcpServer/tool/call.`);
+
+const bridge = createBridgeServer({
+  port,
+  path: wsPath,
+  health: () => health,
+  async startTurn(ws, message) {
+    if (health.state !== "ready") return send(ws, { type: "error", requestId: message.requestId, message: health.reason ?? "Bridge is not ready" });
+    if (active.size) return send(ws, { type: "error", requestId: message.requestId, message: "Another Codex turn is already in flight" });
+    try {
+      const turnModel = optionalClientString(message.model, "model") ?? defaultModel;
+      const turnEffort = optionalClientString(message.effort, "effort") ?? defaultEffort;
+      requireValidModel(turnModel, "model");
+      requireValidEffort(turnEffort, "effort");
+      console.log(`Codex turn requestId=${message.requestId} model=${turnModel} effort=${turnEffort}`);
+      const text = message.context ? `${message.context}\n\n${message.prompt}` : message.prompt;
+      const result = await codex.request("turn/start", {
+        threadId,
+        input: [{ type: "text", text, text_elements: [] }],
+        model: turnModel,
+        effort: turnEffort,
+        approvalPolicy: codexApprovalPolicy,
+      });
+      const turnId = result.turn.id;
+      active.set(turnId, { requestId: message.requestId, ws, turnId, fullText: "" });
+    } catch (error) {
+      send(ws, { type: "error", requestId: message.requestId, message: String(error) });
+    }
+  },
+  async cancel(ws, message) {
+    const record = [...active.values()].find((entry) => entry.requestId === message.requestId);
+    if (!record) return send(ws, { type: "error", requestId: message.requestId, message: "No active turn for requestId" });
+    await codex.request("turn/interrupt", { threadId, turnId: record.turnId }).catch((error) => send(ws, { type: "error", requestId: message.requestId, message: String(error) }));
+  },
+  async steer(ws, message) {
+    const record = [...active.values()].find((entry) => entry.requestId === message.requestId);
+    if (!record) return send(ws, { type: "error", requestId: message.requestId, message: "No active turn for requestId" });
+    await codex.request("turn/steer", { threadId, expectedTurnId: record.turnId, input: [{ type: "text", text: message.instruction, text_elements: [] }] }).catch((error) =>
+      send(ws, { type: "error", requestId: message.requestId, message: String(error) }),
+    );
+  },
+});
+
+console.log(`UEvolve Codex Bridge listening at ${bridge.url}`);
+console.log(`Codex app-server transport=${child.transport} endpoint=${child.endpoint}`);
+console.log(`Codex app-server args: ${formatSpawnArgs(child.spawnArgs)}`);
+console.log(`MCP registration: ${JSON.stringify(child.mcpRegistration)}`);
+console.log("MCP status: not queried at bridge startup; Codex will discover tools lazily from config");
+console.log(`Codex defaults model=${defaultModel} effort=${defaultEffort} approvalPolicy=${approvalMode} sandbox=${sandbox} log=${logPath}`);
+
+async function shutdown(): Promise<void> {
+  for (const record of active.values()) await codex.request("turn/interrupt", { threadId, turnId: record.turnId }).catch(() => {});
+  bridge.close();
+  await codex.close();
+  child.proc.kill("SIGTERM");
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+function isToolItem(item: any): boolean {
+  return ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"].includes(item.type);
+}
+function toolName(item: any): string {
+  return item.tool ?? item.command ?? item.type;
+}
+function toolArgs(item: any): any {
+  return item.arguments ?? { command: item.command, cwd: item.cwd, changes: item.changes };
+}
+function toolText(item: any): string {
+  return item.aggregatedOutput ?? JSON.stringify(item.result ?? item.contentItems ?? item.error ?? "");
+}
+function toolError(item: any): boolean {
+  return Boolean(item.error) || item.success === false || (typeof item.exitCode === "number" && item.exitCode !== 0);
+}
+function extractFinalText(turn: any): string {
+  return (turn?.items ?? []).filter((item: any) => item.type === "agentMessage").map((item: any) => item.text).join("");
+}
+function developerInstructions(mcpName: string): string {
+  return `You are running through the UEvolve Codex Desktop bridge. Reasoning is on; produce concise answers and prefer one safe MCP tool call over many.
+The registered Unreal MCP server is ${mcpName}. For ANY action that inspects or modifies the Unreal project, call the MCP server ${mcpName} via mcpServer/tool/call. Do NOT use shell commands, curl, or HTTP requests because those are denied by policy.
+Do not attempt to edit files or run commands directly. Do not attempt to write files outside MCP tool calls or run shell commands; those paths are disabled. Avoid destructive actions unless explicitly asked.`;
+}
+function formatSpawnArgs(args: string[]): string {
+  return args.map((arg) => (arg.includes("bearer_token=") ? arg.replace(/bearer_token=.*/, 'bearer_token="<redacted>"') : arg)).join(" ");
+}
+function envDefault(name: string, fallback: string): string {
+  return process.env[name]?.trim() || fallback;
+}
+function optionalClientString(value: any, field: string): string | undefined {
+  if (value == null) return undefined;
+  if (typeof value !== "string") throw new Error(`${field} must be a string`);
+  return value.trim() || undefined;
+}
+function requireValidModel(value: string, field: string): string {
+  if (!/^[a-zA-Z0-9._-]{1,64}$/.test(value)) throw new Error(`${field} must match /^[a-zA-Z0-9._\\-]{1,64}$/`);
+  return value;
+}
+function requireValidEffort(value: string, field: string): string {
+  if (!["low", "medium", "high", "xhigh"].includes(value)) throw new Error(`${field} must be one of low, medium, high, xhigh`);
+  return value;
+}

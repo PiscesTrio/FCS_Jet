@@ -1,0 +1,31 @@
+# No line ending normalisation anywhere.
+#
+# This repository vendors the whole UEAtelier Tools/ tree and Plugins/UnrealMcp/ source
+# tree. Forcing eol would rewrite those third party files on every checkout and produce
+# meaningless diff noise. The project is developed on Windows only, so storing and
+# checking out bytes verbatim is the least surprising behaviour.
+
+# ---- UE assets: binary, never diffed, never auto merged ----
+# Asset conflicts can only be resolved by picking one side or by redoing the edit in the
+# editor. Letting git attempt a three way merge just produces a corrupt .uasset.
+*.uasset  binary -merge -diff
+*.umap    binary -merge -diff
+*.ubulk   binary -merge -diff
+*.uexp    binary -merge -diff
+*.uptnl   binary -merge -diff
+
+# ---- Other binaries ----
+*.fbx  binary -merge -diff
+*.png  binary -diff
+*.jpg  binary -diff
+*.tga  binary -diff
+*.wav  binary -diff
+*.dll  binary -diff
+*.pdb  binary -diff
+*.zip  binary -diff
+
+# To switch the assets over to Git LFS later:
+#   git lfs install
+#   git lfs track "*.uasset" "*.umap" "*.ubulk" "*.uexp"
+# Note that every machine cloning this repository would then need git-lfs installed,
+# otherwise the working copy only receives pointer files.

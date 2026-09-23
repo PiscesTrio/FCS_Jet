@@ -1,0 +1,2760 @@
+#include "UnrealMcpToolRegistrar.h"
+
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Misc/App.h"
+#include "UnrealMcpExtensionLifecycle.h"
+#include "UnrealMcpToolRegistry.h"
+#include "UnrealMcpUserToolLock.h"
+#include "UnrealMcpUserToolRegistry.h"
+
+namespace UnrealMcp
+{
+	TSharedPtr<FJsonObject> MakeObjectSchema();
+	TSharedPtr<FJsonObject> MakeStringProperty(const FString& Description, const FString& DefaultValue);
+	TSharedPtr<FJsonObject> MakeBoolProperty(const FString& Description, bool bDefaultValue);
+	TSharedPtr<FJsonObject> MakeNumberProperty(const FString& Description, double DefaultValue);
+	TSharedPtr<FJsonObject> MakeStringArrayProperty(const FString& Description);
+	void AddToolDefinition(
+		TArray<TSharedPtr<FJsonValue>>& ToolsArray,
+		const FString& Name,
+		const FString& Title,
+		const FString& Description,
+		const TSharedPtr<FJsonObject>& InputSchema);
+	FString GetHostBuildPlatformName();
+
+	namespace
+	{
+		FUnrealMcpToolDescriptor MakeDescriptor(
+			const FString& Name,
+			const FString& Title,
+			const FString& Description,
+			const FString& Category,
+			const FString& SourceFile,
+			EUnrealMcpToolRisk Risk = EUnrealMcpToolRisk::ReadOnly)
+		{
+			FUnrealMcpToolDescriptor Descriptor;
+			Descriptor.Name = Name;
+			Descriptor.Title = Title;
+			Descriptor.Description = Description;
+			Descriptor.Category = Category;
+			Descriptor.HandlerName = Name;
+			Descriptor.SourceFile = SourceFile;
+			Descriptor.RiskLevel = Risk;
+			Descriptor.Owner = TEXT("UEAtelier Core");
+			Descriptor.DocsPath = TEXT("README.md#tool-coverage");
+			Descriptor.Reason = TEXT("Code descriptor default; reviewed registry JSON may override exposure, risk, owner, docs, and test metadata.");
+			return Descriptor;
+		}
+
+		TSharedPtr<FJsonObject> MakeBuildTargetSchema(const FString& DefaultTarget, const FString& DefaultMemoryKey)
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("target"), MakeStringProperty(TEXT("UBT target to build."), DefaultTarget));
+			Properties->SetObjectField(TEXT("platform"), MakeStringProperty(TEXT("UBT platform. Empty/default uses the host editor platform."), GetHostBuildPlatformName()));
+			Properties->SetObjectField(TEXT("configuration"), MakeStringProperty(TEXT("UBT configuration."), TEXT("Development")));
+			Properties->SetObjectField(TEXT("extraArgs"), MakeStringProperty(TEXT("Optional additional UBT arguments appended to the build command."), FString()));
+			Properties->SetObjectField(TEXT("toolName"), MakeStringProperty(TEXT("Optional tool name to persist into project memory with the build result."), FString()));
+			Properties->SetObjectField(TEXT("testRequestPath"), MakeStringProperty(TEXT("Optional project-local TestRequest.json path to persist in project memory."), FString()));
+			Properties->SetObjectField(TEXT("testsDir"), MakeStringProperty(TEXT("Optional project-local Tests directory to persist in project memory."), FString()));
+			Properties->SetObjectField(TEXT("scaffoldDir"), MakeStringProperty(TEXT("Optional scaffold directory. If testRequestPath is empty, scaffoldDir/TestRequest.json is remembered."), FString()));
+			Properties->SetObjectField(TEXT("memoryKey"), MakeStringProperty(TEXT("Project memory key used for build status handoff."), DefaultMemoryKey));
+			Properties->SetObjectField(TEXT("writeProjectMemory"), MakeBoolProperty(TEXT("Whether to write build status before and after the build."), true));
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakePackagedBuildSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("platform"), MakeStringProperty(TEXT("Alias for targetPlatform. Empty/default uses the host editor platform."), GetHostBuildPlatformName()));
+			Properties->SetObjectField(TEXT("targetPlatform"), MakeStringProperty(TEXT("Target platform for BuildCookRun: Win64, Mac, Linux, Android, or IOS."), GetHostBuildPlatformName()));
+			Properties->SetObjectField(TEXT("configuration"), MakeStringProperty(TEXT("BuildCookRun configuration."), TEXT("Development")));
+			Properties->SetObjectField(TEXT("extraArgs"), MakeStringProperty(TEXT("Optional additional RunUAT arguments appended to the BuildCookRun command."), FString()));
+			Properties->SetObjectField(TEXT("outputDirectory"), MakeStringProperty(TEXT("Optional project-local archive directory. Defaults to Saved/StagedBuilds."), FString()));
+			Properties->SetObjectField(TEXT("map"), MakeStringProperty(TEXT("Optional single map to cook. If omitted, BuildCookRun uses configured maps to cook."), FString()));
+			Properties->SetObjectField(TEXT("memoryKey"), MakeStringProperty(TEXT("Project memory key used for packaged build status."), TEXT("mcp.extension.build_packaged")));
+			Properties->SetObjectField(TEXT("writeProjectMemory"), MakeBoolProperty(TEXT("Whether to write packaged build status before and after BuildCookRun."), true));
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakeSchemaWithRequired(const TSharedPtr<FJsonObject>& Properties, const TArray<FString>& RequiredFields)
+		{
+			TArray<TSharedPtr<FJsonValue>> Required;
+			for (const FString& RequiredField : RequiredFields)
+			{
+				Required.Add(MakeShared<FJsonValueString>(RequiredField));
+			}
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Schema->SetArrayField(TEXT("required"), Required);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakeLinearColorValueSchema()
+		{
+			TSharedPtr<FJsonObject> ColorProperties = MakeShared<FJsonObject>();
+			ColorProperties->SetObjectField(TEXT("r"), MakeNumberProperty(TEXT("Red channel value."), 1.0));
+			ColorProperties->SetObjectField(TEXT("g"), MakeNumberProperty(TEXT("Green channel value."), 1.0));
+			ColorProperties->SetObjectField(TEXT("b"), MakeNumberProperty(TEXT("Blue channel value."), 1.0));
+			ColorProperties->SetObjectField(TEXT("a"), MakeNumberProperty(TEXT("Alpha channel value."), 1.0));
+			return MakeSchemaWithRequired(ColorProperties, TArray<FString>{ TEXT("r"), TEXT("g"), TEXT("b"), TEXT("a") });
+		}
+
+		TSharedPtr<FJsonObject> MakeEnumStringProperty(const FString& Description, const FString& DefaultValue, const TArray<FString>& Values)
+		{
+			TSharedPtr<FJsonObject> Property = MakeStringProperty(Description, DefaultValue);
+			TArray<TSharedPtr<FJsonValue>> EnumValues;
+			for (const FString& Value : Values)
+			{
+				EnumValues.Add(MakeShared<FJsonValueString>(Value));
+			}
+			Property->SetArrayField(TEXT("enum"), EnumValues);
+			return Property;
+		}
+
+		TSharedPtr<FJsonObject> MakeIntegerProperty(const FString& Description, int32 DefaultValue)
+		{
+			TSharedPtr<FJsonObject> Property = MakeShared<FJsonObject>();
+			Property->SetStringField(TEXT("type"), TEXT("integer"));
+			Property->SetStringField(TEXT("description"), Description);
+			Property->SetNumberField(TEXT("default"), DefaultValue);
+			return Property;
+		}
+
+		TSharedPtr<FJsonObject> MakeConstBoolProperty(const FString& Description, bool ConstValue)
+		{
+			TSharedPtr<FJsonObject> Property = MakeBoolProperty(Description, ConstValue);
+			Property->SetBoolField(TEXT("const"), ConstValue);
+			return Property;
+		}
+
+		TSharedPtr<FJsonObject> MakeUserToolNameProperty(const FString& Description)
+		{
+			TSharedPtr<FJsonObject> Property = MakeStringProperty(Description, FString());
+			Property->SetNumberField(TEXT("minLength"), 6.0);
+			Property->SetStringField(TEXT("pattern"), TEXT("^user\\.[A-Za-z0-9_]+$"));
+			return Property;
+		}
+
+		TArray<TSharedPtr<FJsonValue>> MakeEnumValues(const TArray<FString>& Values)
+		{
+			TArray<TSharedPtr<FJsonValue>> EnumValues;
+			for (const FString& Value : Values)
+			{
+				EnumValues.Add(MakeShared<FJsonValueString>(Value));
+			}
+			return EnumValues;
+		}
+
+		TSharedPtr<FJsonObject> MakePlayerInputKeySpecSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("key"), MakeStringProperty(TEXT("Input key name such as W, S, A, D, MouseX, MouseY, or SpaceBar."), FString()));
+			Properties->SetObjectField(TEXT("scale"), MakeNumberProperty(TEXT("Axis scale for this key. Ignored for action mappings."), 1.0));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("key") });
+		}
+
+		TSharedPtr<FJsonObject> MakePlayerInputMappingSlotSchema()
+		{
+			TSharedPtr<FJsonObject> KeysProperty = MakeShared<FJsonObject>();
+			KeysProperty->SetStringField(TEXT("type"), TEXT("array"));
+			KeysProperty->SetStringField(TEXT("description"), TEXT("Keys to bind for this named mapping."));
+			KeysProperty->SetObjectField(TEXT("items"), MakePlayerInputKeySpecSchema());
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("kind"), MakeEnumStringProperty(TEXT("Legacy mapping kind. Use action for button-style events and axis for scaled continuous input."), TEXT("axis"), TArray<FString>{ TEXT("axis"), TEXT("action") }));
+			Properties->SetObjectField(TEXT("keys"), KeysProperty);
+			Properties->SetObjectField(TEXT("inputActionPath"), MakeStringProperty(TEXT("Optional Enhanced Input UInputAction asset path used when inputSystem is enhanced."), FString()));
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Schema->SetArrayField(TEXT("required"), TArray<TSharedPtr<FJsonValue>>());
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakePlayerInputMappingsSchema()
+		{
+			TSharedPtr<FJsonObject> SlotSchema = MakePlayerInputMappingSlotSchema();
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("MoveForward"), SlotSchema);
+			Properties->SetObjectField(TEXT("MoveRight"), SlotSchema);
+			Properties->SetObjectField(TEXT("LookYaw"), SlotSchema);
+			Properties->SetObjectField(TEXT("LookPitch"), SlotSchema);
+			Properties->SetObjectField(TEXT("Jump"), SlotSchema);
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetStringField(TEXT("description"), TEXT("Optional overrides for standard player-control mappings plus arbitrary legacy axis/action mapping names."));
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Schema->SetObjectField(TEXT("additionalProperties"), SlotSchema);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakeConfigurePlayerInputSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("inputSystem"), MakeEnumStringProperty(TEXT("Input stack to configure."), TEXT("auto"), TArray<FString>{ TEXT("auto"), TEXT("legacy"), TEXT("enhanced") }));
+			Properties->SetObjectField(TEXT("profile"), MakeEnumStringProperty(TEXT("Mapping profile to use before applying mappings overrides."), TEXT("third_person_basic"), TArray<FString>{ TEXT("third_person_basic"), TEXT("custom") }));
+			Properties->SetObjectField(TEXT("mappings"), MakePlayerInputMappingsSchema());
+			Properties->SetObjectField(TEXT("enhancedInputMappingContextPath"), MakeStringProperty(TEXT("Optional Enhanced Input UInputMappingContext asset path."), FString()));
+			Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview intended input config writes without mutating settings or mapping assets."), true));
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakeVerifyPlayerControlsSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("expectedPawnClass"), MakeStringProperty(TEXT("Optional expected pawn class path, for example /Game/Player/BP_Player.BP_Player_C or /Script/Engine.Character."), FString()));
+			Properties->SetObjectField(TEXT("startIfNeeded"), MakeBoolProperty(TEXT("Start PIE when no PIE session is active; the tool waits privately for BeginPIE before inspecting."), false));
+			Properties->SetObjectField(TEXT("stopAfter"), MakeBoolProperty(TEXT("Stop PIE after verification. If omitted at runtime, auto-started PIE is stopped and pre-existing PIE is left running."), false));
+
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakePieInputProbeSchema()
+		{
+			TArray<FString> Profiles = {
+				TEXT("moveForward"),
+				TEXT("moveBackward"),
+				TEXT("moveRight"),
+				TEXT("moveLeft"),
+				TEXT("jump"),
+				TEXT("lookYaw"),
+				TEXT("lookPitch")
+			};
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("action"), MakeEnumStringProperty(TEXT("Start a new probe or poll an existing probe result."), FString(), TArray<FString>{ TEXT("start"), TEXT("result") }));
+			Properties->SetObjectField(TEXT("inputProfile"), MakeEnumStringProperty(TEXT("Input profile to inject while action=start."), FString(), Profiles));
+			TSharedPtr<FJsonObject> DurationProperty = MakeNumberProperty(TEXT("Sampling duration in seconds for action=start."), 0.5);
+			DurationProperty->SetNumberField(TEXT("minimum"), 0.05);
+			DurationProperty->SetNumberField(TEXT("maximum"), 5.0);
+			Properties->SetObjectField(TEXT("durationSeconds"), DurationProperty);
+			Properties->SetObjectField(TEXT("probeId"), MakeStringProperty(TEXT("Probe id returned by action=start; required when action=result."), FString()));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("action") });
+		}
+
+		TSharedPtr<FJsonObject> MakeVerifyViewportWidgetsSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("widgetClassFilter"), MakeStringProperty(TEXT("Optional exact widget generated class path filter, for example /Game/UI/WBP_TestHUD.WBP_TestHUD_C."), FString()));
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Schema->SetArrayField(TEXT("required"), TArray<TSharedPtr<FJsonValue>>());
+			return Schema;
+		}
+
+		TSharedPtr<FJsonObject> MakeBlueprintEventGraphNodeSchema(const FString& NameField, const FString& NameDescription, const TArray<FString>& RequiredFields)
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+			Properties->SetObjectField(TEXT("graphName"), MakeStringProperty(TEXT("Target graph name. Defaults to EventGraph; only EventGraph is supported in this release."), TEXT("EventGraph")));
+			Properties->SetObjectField(NameField, MakeStringProperty(NameDescription, FString()));
+			Properties->SetObjectField(TEXT("x"), MakeNumberProperty(TEXT("Graph X position."), 0.0));
+			Properties->SetObjectField(TEXT("y"), MakeNumberProperty(TEXT("Graph Y position."), 0.0));
+			return MakeSchemaWithRequired(Properties, RequiredFields);
+		}
+
+		TSharedPtr<FJsonObject> MakeBlueprintAddComponentSchema()
+		{
+			TSharedPtr<FJsonObject> AttachParentProperty = MakeStringProperty(TEXT("Optional SCS or native scene component name to attach under. Empty uses the Blueprint root or DefaultSceneRoot."), FString());
+			AttachParentProperty->SetStringField(TEXT("default"), FString());
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+			Properties->SetObjectField(TEXT("componentClass"), MakeStringProperty(TEXT("Component class path, for example /Script/Engine.SpringArmComponent."), FString()));
+			Properties->SetObjectField(TEXT("componentName"), MakeStringProperty(TEXT("New component variable name."), FString()));
+			Properties->SetObjectField(TEXT("attachParentComponentName"), AttachParentProperty);
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("blueprintPath"), TEXT("componentClass"), TEXT("componentName") });
+		}
+
+		TSharedPtr<FJsonObject> MakeBlueprintSetComponentPropertySchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+			Properties->SetObjectField(TEXT("componentName"), MakeStringProperty(TEXT("SCS component variable name."), FString()));
+			Properties->SetObjectField(TEXT("propertyName"), MakeStringProperty(TEXT("Direct component template property name to set."), FString()));
+			Properties->SetObjectField(TEXT("value"), MakeStringProperty(TEXT("Value text imported through Unreal property serialization."), FString()));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("blueprintPath"), TEXT("componentName"), TEXT("propertyName"), TEXT("value") });
+		}
+
+		TSharedPtr<FJsonObject> MakeBlueprintSetClassDefaultSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+			Properties->SetObjectField(TEXT("propertyName"), MakeStringProperty(TEXT("Direct class default property name to set."), FString()));
+			Properties->SetObjectField(TEXT("value"), MakeStringProperty(TEXT("Value text imported through Unreal property serialization."), FString()));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("blueprintPath"), TEXT("propertyName"), TEXT("value") });
+		}
+
+		TSharedPtr<FJsonObject> MakeSetMapGameModeSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("gameModeClassPath"), MakeStringProperty(TEXT("GameModeBase class path to set."), FString()));
+			Properties->SetObjectField(TEXT("scope"), MakeEnumStringProperty(TEXT("Where to apply the GameMode."), TEXT("worldSettingsOverride"), TArray<FString>{ TEXT("worldSettingsOverride"), TEXT("projectDefault") }));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("gameModeClassPath") });
+		}
+
+		TSharedPtr<FJsonObject> MakeActorSetAutoPossessSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("actorName"), MakeStringProperty(TEXT("Actor label, actor name, or unique actor path to edit."), FString()));
+			Properties->SetObjectField(TEXT("autoPossessPlayer"), MakeEnumStringProperty(TEXT("AutoPossessPlayer value to set on the Pawn."), TEXT("Player0"), TArray<FString>{ TEXT("Disabled"), TEXT("Player0"), TEXT("Player1"), TEXT("Player2"), TEXT("Player3") }));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("actorName") });
+		}
+
+		TSharedPtr<FJsonObject> MakeBlueprintGameplayNodeSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+			Properties->SetObjectField(TEXT("graphName"), MakeStringProperty(TEXT("Target graph name. Defaults to EventGraph; only EventGraph is supported in this release."), TEXT("EventGraph")));
+			Properties->SetObjectField(TEXT("nodeKind"), MakeEnumStringProperty(
+				TEXT("Gameplay helper node to add."),
+				FString(),
+				TArray<FString>{
+					TEXT("AddMovementInput"),
+					TEXT("AddControllerYawInput"),
+					TEXT("AddControllerPitchInput"),
+					TEXT("GetActorForwardVector"),
+					TEXT("GetActorRightVector"),
+					TEXT("GetControlRotation"),
+					TEXT("Jump"),
+					TEXT("FloatGreaterThan")
+				}));
+			Properties->SetObjectField(TEXT("x"), MakeNumberProperty(TEXT("Graph X position."), 0.0));
+			Properties->SetObjectField(TEXT("y"), MakeNumberProperty(TEXT("Graph Y position."), 0.0));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("blueprintPath"), TEXT("nodeKind") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeStringArrayProperty(const FString& Description)
+		{
+			TSharedPtr<FJsonObject> Property = MakeShared<FJsonObject>();
+			Property->SetStringField(TEXT("type"), TEXT("array"));
+			Property->SetStringField(TEXT("description"), Description);
+			TSharedPtr<FJsonObject> Items = MakeShared<FJsonObject>();
+			Items->SetStringField(TEXT("type"), TEXT("string"));
+			Property->SetObjectField(TEXT("items"), Items);
+			return Property;
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeScopeProperty()
+		{
+			return MakeEnumStringProperty(
+				TEXT("Readable code scope to scan."),
+				TEXT("project"),
+				TArray<FString>{ TEXT("project"), TEXT("source"), TEXT("plugins"), TEXT("user_tools"), TEXT("python_tools") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeWorkspaceStatusSchema()
+		{
+			return MakeSchemaWithRequired(MakeShared<FJsonObject>(), TArray<FString>());
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeListFilesSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("scope"), MakeCodeScopeProperty());
+			Properties->SetObjectField(TEXT("extensions"), MakeCodeStringArrayProperty(TEXT("Optional extension filter, for example .cpp or .py.")));
+			Properties->SetObjectField(TEXT("glob"), MakeStringProperty(TEXT("Optional project-relative wildcard filter."), FString()));
+			Properties->SetObjectField(TEXT("maxResults"), MakeNumberProperty(TEXT("Maximum returned file records. Default 500, hard cap 2000."), 500.0));
+			return MakeSchemaWithRequired(Properties, TArray<FString>());
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeReadFileSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("path"), MakeStringProperty(TEXT("Project-relative code file path to read."), FString()));
+			Properties->SetObjectField(TEXT("startLine"), MakeNumberProperty(TEXT("1-based line number to start reading from."), 1.0));
+			Properties->SetObjectField(TEXT("lineCount"), MakeNumberProperty(TEXT("Optional number of lines to return."), 0.0));
+			Properties->SetObjectField(TEXT("maxChars"), MakeNumberProperty(TEXT("Maximum returned characters. Default 100000, hard cap 500000."), 100000.0));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("path") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeSearchSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("query"), MakeStringProperty(TEXT("Search query."), FString()));
+			Properties->SetObjectField(TEXT("mode"), MakeEnumStringProperty(TEXT("Search mode."), TEXT("literal"), TArray<FString>{ TEXT("literal"), TEXT("regex"), TEXT("filename") }));
+			Properties->SetObjectField(TEXT("scope"), MakeCodeScopeProperty());
+			Properties->SetObjectField(TEXT("extensions"), MakeCodeStringArrayProperty(TEXT("Optional extension filter, for example .cpp or .py.")));
+			Properties->SetObjectField(TEXT("contextLines"), MakeNumberProperty(TEXT("Context lines around content matches. Default 2, hard cap 10."), 2.0));
+			Properties->SetObjectField(TEXT("maxMatches"), MakeNumberProperty(TEXT("Maximum returned matches. Default 200, hard cap 1000."), 200.0));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("query") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeEditSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("path"), MakeStringProperty(TEXT("Project-relative file path to edit."), FString()));
+			Properties->SetObjectField(TEXT("expectedSha256"), MakeStringProperty(TEXT("Expected whole-file sha256 from code_read_file."), FString()));
+			Properties->SetObjectField(TEXT("operation"), MakeEnumStringProperty(TEXT("Structured edit operation."), FString(), TArray<FString>{ TEXT("replace_exact"), TEXT("insert_before"), TEXT("insert_after"), TEXT("create_file") }));
+			Properties->SetObjectField(TEXT("oldText"), MakeStringProperty(TEXT("Exact existing text for replace_exact."), FString()));
+			Properties->SetObjectField(TEXT("newText"), MakeStringProperty(TEXT("New text to insert, replace, or create."), FString()));
+			Properties->SetObjectField(TEXT("anchorText"), MakeStringProperty(TEXT("Exact anchor text for insert_before or insert_after."), FString()));
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("path"), TEXT("expectedSha256"), TEXT("operation") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodePreviewChangeSchema()
+		{
+			TSharedPtr<FJsonObject> EditsProperty = MakeShared<FJsonObject>();
+			EditsProperty->SetStringField(TEXT("type"), TEXT("array"));
+			EditsProperty->SetStringField(TEXT("description"), TEXT("Structured text edits to preview."));
+			EditsProperty->SetObjectField(TEXT("items"), MakeCodeEditSchema());
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("edits"), EditsProperty);
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("edits") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeExpectedShaMapSchema()
+		{
+			return MakeSchemaWithRequired(MakeShared<FJsonObject>(), TArray<FString>());
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeApplyChangeSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("previewId"), MakeStringProperty(TEXT("Preview id returned by unreal.code_preview_change."), FString()));
+			Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Re-validate without writing user files. Defaults to true."), true));
+			Properties->SetObjectField(TEXT("confirmHighRisk"), MakeBoolProperty(TEXT("Required for high-risk paths on real apply."), false));
+			Properties->SetObjectField(TEXT("expectedSha256PerFile"), MakeCodeExpectedShaMapSchema());
+			return MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("previewId") });
+		}
+
+		TSharedPtr<FJsonObject> MakeCodeRollbackChangeSchema()
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("editId"), MakeStringProperty(TEXT("Code edit id to roll back."), FString()));
+			Properties->SetObjectField(TEXT("manifestPath"), MakeStringProperty(TEXT("Project-local code edit manifest path to roll back."), FString()));
+			Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview rollback without writing files. Defaults to true."), true));
+			Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Proceed over drift when a real rollback is requested."), false));
+			return MakeSchemaWithRequired(Properties, TArray<FString>());
+		}
+
+		void ApplyV028WriteDescriptorPolicy(FUnrealMcpToolDescriptor& Descriptor)
+		{
+			Descriptor.bRequiresWrite = true;
+			Descriptor.bPreflightSupport = true;
+			Descriptor.bPostcheckSupport = true;
+			Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+			Descriptor.Reason = TEXT("Descriptor: v0.28 playable third-person Character Blueprint authoring primitive with fixed schema and readback.");
+		}
+
+		void RegisterEditorMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.editor_status"),
+					TEXT("Editor Status"),
+					TEXT("Returns the current Unreal Editor status, map, selected counts, engine version, and PIE state."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp")),
+				MakeObjectSchema());
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.editor.engine_version"),
+					TEXT("Editor Engine Version"),
+					TEXT("Returns the running Unreal Editor engine version as structured major, minor, patch, and version_string fields."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorEngineVersionTool.cpp")),
+				MakeObjectSchema());
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("category"), MakeStringProperty(TEXT("Project settings category: engine, editor, game, input, rendering, or physics."), TEXT("engine")));
+				Properties->SetObjectField(TEXT("key"), MakeStringProperty(TEXT("Project settings key or dot-path inside the category, for example DefaultGameMode, DefaultInputAxisMappings, or DefaultRHI."), FString()));
+				Properties->SetObjectField(TEXT("effective"), MakeBoolProperty(TEXT("Return the current runtime/PIE value when available; otherwise return the configured default."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("category")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("key")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.project_settings_get"),
+					TEXT("Get Project Setting"),
+					TEXT("Reads a project setting; pass `effective=true` to get the current runtime/PIE value when available (else returns the configured default)."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: read-only project settings inspector for v0.15 C++ readback coverage.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.editor_set_map_game_mode"),
+					TEXT("Set Map GameMode"),
+					TEXT("Sets the current map WorldSettings GameMode override or the project default GameMode and returns readback."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeSetMapGameModeSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.configure_player_input"),
+					TEXT("Configure Player Input"),
+					TEXT("Configures standard and arbitrary legacy player-control input mappings for legacy input or an Enhanced Input mapping context, defaulting to dry-run diagnostics."),
+					TEXT("editor"),
+					TEXT("UnrealMcpPlayerInputTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Tools/UnrealMcpToolDocs/editor/configure_player_input.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.27.1 core gameplay setup primitive for reusable Legacy/Enhanced Input configuration under dry-run and postcheck evidence.");
+				Registrar.Add(Descriptor, MakeConfigurePlayerInputSchema());
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("sourcePath"), MakeStringProperty(TEXT("Source asset package/object path under /Game, for example /Game/Foo/OldAsset or /Game/Foo/OldAsset.OldAsset."), FString()));
+				Properties->SetObjectField(TEXT("destinationPath"), MakeStringProperty(TEXT("Full destination package/object path under /Game including the new asset name."), FString()));
+				Properties->SetObjectField(TEXT("createRedirector"), MakeBoolProperty(TEXT("Whether the move may leave an UObjectRedirector at the old path for unresolved referencers."), true));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview referencers, path validity, and destination collision without moving the asset."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("sourcePath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("destinationPath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.asset_move"),
+					TEXT("Move Asset"),
+					TEXT("Moves or renames one asset to a new /Game package path using Unreal AssetTools, with optional dry-run planning."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 5 migration tool for single-asset rename/move through AssetTools.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("path"), MakeStringProperty(TEXT("Content Browser subtree to scan for UObjectRedirector assets."), TEXT("/Game")));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview redirectors and affected referencers without mutating packages."), true));
+				Properties->SetObjectField(TEXT("recursive"), MakeBoolProperty(TEXT("Whether to include child folders."), true));
+				Properties->SetObjectField(TEXT("failOnAnyError"), MakeBoolProperty(TEXT("Return FIXUP_FAILED when any redirector remains after a real fixup."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.redirector_fixup"),
+					TEXT("Fix Up Redirectors"),
+					TEXT("Scans a /Game subtree for UObjectRedirector assets and runs AssetTools fixup to rewrite referencers and remove fixed redirectors."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 5 migration tool for Content Browser redirector cleanup.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("fromAssetPath"), MakeStringProperty(TEXT("Source asset whose referencers should be rewritten."), FString()));
+				Properties->SetObjectField(TEXT("toAssetPath"), MakeStringProperty(TEXT("Destination asset that should replace source references."), FString()));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview type compatibility and referencing asset count without rewriting references."), true));
+				Properties->SetObjectField(TEXT("deleteSourceAfter"), MakeBoolProperty(TEXT("Delete the source asset after references are consolidated in a real run."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("fromAssetPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("toAssetPath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.dependency_remap"),
+					TEXT("Remap Asset Dependencies"),
+					TEXT("Replaces references to one asset with references to another asset using ObjectTools consolidation without deleting the source by default."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 5 migration tool for replacing asset referencers.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("targetEngineVersion"), MakeEnumStringProperty(TEXT("Target EngineAssociation value. UE 5.7 and 5.8 are primary; UE 5.6 is maintenance."), FString(), TArray<FString>{ TEXT("5.6"), TEXT("5.7"), TEXT("5.8") }));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview the EngineAssociation edit and compatibility warnings without writing the .uproject."), true));
+				Properties->SetObjectField(TEXT("projectFilePath"), MakeStringProperty(TEXT("Absolute .uproject path to edit. Defaults to the current project file."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("targetEngineVersion")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.project_version_migration"),
+					TEXT("Project Version Migration"),
+					TEXT("Updates a .uproject EngineAssociation across UE 5.6, UE 5.7, and UE 5.8, reports the support tier, and lists remaining manual rebuild steps."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.35 support-contract tool for reversible primary UE 5.7/5.8 and maintenance UE 5.6 EngineAssociation changes.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.list_maps"),
+					TEXT("List Maps"),
+					TEXT("Lists all map assets under /Game."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp")),
+				MakeObjectSchema());
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.list_selected_assets"),
+					TEXT("List Selected Assets"),
+					TEXT("Lists the assets currently selected in the Content Browser."),
+					TEXT("editor"),
+					TEXT("UnrealMcpEditorTools.cpp")),
+				MakeObjectSchema());
+		}
+
+		void RegisterCodeMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_workspace_status"),
+					TEXT("Code Workspace Status"),
+					TEXT("Returns Code tool workspace roots, path policy, extension allowlists, latest manifest, and extension lock status."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"));
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools read-only workspace policy status.");
+				Registrar.Add(Descriptor, MakeCodeWorkspaceStatusSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_list_files"),
+					TEXT("List Code Files"),
+					TEXT("Lists readable project code files within bounded scopes while excluding runtime, generated, Saved, and Content directories."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"));
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools read-only file discovery.");
+				Registrar.Add(Descriptor, MakeCodeListFilesSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_read_file"),
+					TEXT("Read Code File"),
+					TEXT("Reads a bounded slice of a readable project code file and returns the whole-file sha256 for later edit validation."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"));
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools read-only file readback with whole-file sha.");
+				Registrar.Add(Descriptor, MakeCodeReadFileSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_search"),
+					TEXT("Search Code"),
+					TEXT("Searches readable project code files using bounded literal, regex, or filename matching."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"));
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools bounded in-tree code search.");
+				Registrar.Add(Descriptor, MakeCodeSearchSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_preview_change"),
+					TEXT("Preview Code Change"),
+					TEXT("Previews structured project code edits with sha and path-policy checks; full implementation lands in v0.29 Wave B."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bPreflightSupport = true;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools preview entrypoint, Wave A stubbed handler.");
+				Registrar.Add(Descriptor, MakeCodePreviewChangeSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_apply_change"),
+					TEXT("Apply Code Change"),
+					TEXT("Applies a previously previewed code change with dry-run, backup, lock, and postcheck semantics; full implementation lands in v0.29 Wave B."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools apply entrypoint, Wave A stubbed handler.");
+				Registrar.Add(Descriptor, MakeCodeApplyChangeSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.code_rollback_change"),
+					TEXT("Rollback Code Change"),
+					TEXT("Rolls back a code edit manifest with dry-run, drift detection, lock, and postcheck semantics; full implementation lands in v0.29 Wave B."),
+					TEXT("code"),
+					TEXT("UnrealMcpCodeTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.Reason = TEXT("Descriptor: v0.29 Code tools rollback entrypoint, Wave A stubbed handler.");
+				Registrar.Add(Descriptor, MakeCodeRollbackChangeSchema());
+			}
+		}
+
+		void RegisterActorMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("actorPath"), MakeStringProperty(TEXT("Full actor label, actor name, or unique actor path to inspect."), FString()));
+				Properties->SetObjectField(TEXT("propertyName"), MakeStringProperty(TEXT("UProperty name or dot-path, for example bHidden, Tags, or StaticMeshComponent.StaticMesh."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("actorPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("propertyName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.actor_get_property"),
+					TEXT("Get Actor Property"),
+					TEXT("Reads a single UProperty value from a named actor, including supported dot-paths through struct or object properties."),
+					TEXT("actors"),
+					TEXT("UnrealMcpActorTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: read-only actor property inspector for v0.15 C++ readback coverage.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("actorPath"), MakeStringProperty(TEXT("Full actor label, actor name, or unique actor path to inspect."), FString()));
+				Properties->SetObjectField(TEXT("space"), MakeStringProperty(TEXT("Transform space to read: world or relative."), TEXT("world")));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("actorPath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.actor_get_transform"),
+					TEXT("Get Actor Transform"),
+					TEXT("Reads an actor transform in world or relative space without mutating editor state."),
+					TEXT("actors"),
+					TEXT("UnrealMcpActorTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: read-only actor transform inspector for v0.15 C++ readback coverage.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.list_selected_actors"),
+					TEXT("List Selected Actors"),
+					TEXT("Lists the actors currently selected in the level editor."),
+					TEXT("actors"),
+					TEXT("UnrealMcpActorTools.cpp")),
+				MakeObjectSchema());
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.actor_set_auto_possess"),
+					TEXT("Set Actor Auto Possess"),
+					TEXT("Sets AutoPossessPlayer on a Pawn actor in the current editor world and returns readback."),
+					TEXT("actors"),
+					TEXT("UnrealMcpActorTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeActorSetAutoPossessSchema());
+			}
+		}
+
+		void RegisterBlueprintInspectorMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to inspect."), FString()));
+				Properties->SetObjectField(TEXT("graphName"), MakeStringProperty(TEXT("Optional graph name. If omitted, all standard Blueprint graphs are listed."), FString()));
+				Properties->SetObjectField(TEXT("includePins"), MakeBoolProperty(TEXT("Whether to include pin details and links for each node."), true));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.bp_list_graph_nodes"),
+						TEXT("List Blueprint Graph Nodes"),
+						TEXT("Read-only inspection of Blueprint graphs, nodes, pins, and existing links."),
+						TEXT("blueprint"),
+						TEXT("UnrealMcpBlueprintTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to inspect."), FString()));
+				Properties->SetObjectField(TEXT("graphName"), MakeStringProperty(TEXT("Graph name containing the node."), TEXT("EventGraph")));
+				Properties->SetObjectField(TEXT("nodeGuid"), MakeStringProperty(TEXT("Node GUID to inspect."), FString()));
+				Properties->SetObjectField(TEXT("pinName"), MakeStringProperty(TEXT("Optional pin name. If omitted, all node pins are traced."), FString()));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.bp_trace_pin_connections"),
+						TEXT("Trace Blueprint Pin Connections"),
+						TEXT("Read-only inspection of pin defaults and linked node/pin targets for one Blueprint node."),
+						TEXT("blueprint"),
+						TEXT("UnrealMcpBlueprintTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_add_input_axis_event_node"),
+					TEXT("Add Input Axis Event Node"),
+					TEXT("Adds a legacy InputAxis event node to a Blueprint EventGraph; graphName is accepted for forward compatibility but only EventGraph is supported in this release."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintEventGraphNodeSchema(
+					TEXT("axisName"),
+					TEXT("Legacy input axis mapping name."),
+					TArray<FString>{ TEXT("blueprintPath"), TEXT("axisName") }));
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_add_input_action_event_node"),
+					TEXT("Add Input Action Event Node"),
+					TEXT("Adds a legacy InputAction event node to a Blueprint EventGraph; graphName is accepted for forward compatibility but only EventGraph is supported in this release."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintEventGraphNodeSchema(
+					TEXT("actionName"),
+					TEXT("Legacy input action mapping name."),
+					TArray<FString>{ TEXT("blueprintPath"), TEXT("actionName") }));
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_add_component"),
+					TEXT("Add Blueprint Component"),
+					TEXT("Adds a component template to a Blueprint SimpleConstructionScript and attaches scene components under a named parent or root."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintAddComponentSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_set_component_property"),
+					TEXT("Set Blueprint Component Property"),
+					TEXT("Sets one direct allowlisted property on a Blueprint SCS component template and returns serialized readback."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintSetComponentPropertySchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_set_class_default"),
+					TEXT("Set Blueprint Class Default"),
+					TEXT("Sets one direct allowlisted property on a Blueprint generated class default object and returns serialized readback."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintSetClassDefaultSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_add_gameplay_node"),
+					TEXT("Add Gameplay Blueprint Node"),
+					TEXT("Adds a fixed gameplay helper call node to a Blueprint EventGraph; graphName is accepted for forward compatibility but only EventGraph is supported in this release."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				ApplyV028WriteDescriptorPolicy(Descriptor);
+				Registrar.Add(Descriptor, MakeBlueprintGameplayNodeSchema());
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("graphName"), MakeStringProperty(TEXT("Graph name containing the node. Defaults to EventGraph."), TEXT("EventGraph")));
+				Properties->SetObjectField(TEXT("nodeGuid"), MakeStringProperty(TEXT("Node GUID to delete, as 32 hex digits or hyphenated GUID text."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("nodeGuid")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_delete_node"),
+					TEXT("Delete Blueprint Node"),
+					TEXT("Deletes a user-deletable Blueprint graph node by NodeGuid and reports the severed pin links."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2a C++ Blueprint refactor tool for bounded node deletion.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("variableName"), MakeStringProperty(TEXT("Blueprint member variable name to delete."), FString()));
+				Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Delete even when reference nodes are present."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("variableName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_delete_variable"),
+					TEXT("Delete Blueprint Variable"),
+					TEXT("Deletes a Blueprint member variable after checking local reference nodes unless force=true."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2a C++ Blueprint refactor tool for bounded variable deletion.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("functionName"), MakeStringProperty(TEXT("User function graph name to delete."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("functionName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_delete_function"),
+					TEXT("Delete Blueprint Function"),
+					TEXT("Deletes a user function graph and reports caller nodes found in the same Blueprint."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2a C++ Blueprint refactor tool for bounded function deletion.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("oldName"), MakeStringProperty(TEXT("Existing Blueprint member variable name."), FString()));
+				Properties->SetObjectField(TEXT("newName"), MakeStringProperty(TEXT("New valid Blueprint identifier for the member variable."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("oldName")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("newName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_rename_variable"),
+					TEXT("Rename Blueprint Variable"),
+					TEXT("Renames a Blueprint member variable and rewrites local graph references."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2a C++ Blueprint refactor tool for variable rename and reference update.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("oldName"), MakeStringProperty(TEXT("Existing user function graph name."), FString()));
+				Properties->SetObjectField(TEXT("newName"), MakeStringProperty(TEXT("New valid Blueprint identifier for the function graph."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("oldName")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("newName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_rename_function"),
+					TEXT("Rename Blueprint Function"),
+					TEXT("Renames a user function graph and rewrites local caller nodes."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2a C++ Blueprint refactor tool for function rename and caller update.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("macroName"), MakeStringProperty(TEXT("New valid Blueprint macro graph name."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("macroName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_add_macro_graph"),
+					TEXT("Add Blueprint Macro Graph"),
+					TEXT("Creates a user macro graph on a Blueprint after fixed-name validation and collision checks."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2b C++ Blueprint refactor tool for macro graph creation.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("macroName"), MakeStringProperty(TEXT("Existing Blueprint macro graph name to delete."), FString()));
+				Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Delete even when UK2Node_MacroInstance references are present."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("macroName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_delete_macro_graph"),
+					TEXT("Delete Blueprint Macro Graph"),
+					TEXT("Deletes a Blueprint macro graph after checking local macro instance references unless force=true."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2b C++ Blueprint refactor tool for guarded macro graph deletion.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("interfacePath"), MakeStringProperty(TEXT("Full UInterface-derived class path to implement."), FString()));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("interfacePath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_interface_add"),
+					TEXT("Add Blueprint Interface"),
+					TEXT("Adds a Blueprint-implementable interface to a Blueprint and conforms exposed interface function graphs."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2b C++ Blueprint refactor tool for interface implementation.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("blueprintPath"), MakeStringProperty(TEXT("Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("interfacePath"), MakeStringProperty(TEXT("Full implemented interface class path to remove."), FString()));
+				Properties->SetObjectField(TEXT("preserveFunctions"), MakeBoolProperty(TEXT("Keep interface function graphs as orphan functions instead of deleting them."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("blueprintPath")));
+				Required.Add(MakeShared<FJsonValueString>(TEXT("interfacePath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.bp_interface_remove"),
+					TEXT("Remove Blueprint Interface"),
+					TEXT("Removes an implemented interface from a Blueprint and optionally preserves its function graphs."),
+					TEXT("blueprint"),
+					TEXT("UnrealMcpBlueprintTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 2b C++ Blueprint refactor tool for interface removal.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+		}
+
+		void RegisterWidgetInspectorMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("widgetBlueprintPath"), MakeStringProperty(TEXT("Widget Blueprint asset path to inspect."), FString()));
+			Properties->SetObjectField(TEXT("includeDesignerTree"), MakeBoolProperty(TEXT("Whether to include recursive designer tree children."), true));
+			Properties->SetObjectField(TEXT("includeGraphNodes"), MakeBoolProperty(TEXT("Whether to include EventGraph node summaries."), false));
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.widget_dump_tree"),
+					TEXT("Dump Widget Tree"),
+					TEXT("Read-only inspection of a Widget Blueprint tree, widget variables, slots, and optional EventGraph nodes."),
+					TEXT("widget"),
+					TEXT("UnrealMcpWidgetTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly),
+				Schema);
+		}
+
+		void RegisterWidgetEditMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("widgetBlueprintPath"), MakeStringProperty(TEXT("Widget Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("oldName"), MakeStringProperty(TEXT("Existing widget name inside the Widget Blueprint designer tree."), FString()));
+				Properties->SetObjectField(TEXT("newName"), MakeStringProperty(TEXT("New unique widget name to apply."), FString()));
+				Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Reserved safety override for future rename conflict handling."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.widget_rename"),
+					TEXT("Rename Widget"),
+					TEXT("Renames a UMG widget node while preserving bindings, variable references, animation bindings, and designer hierarchy references."),
+					TEXT("widget"),
+					TEXT("UnrealMcpWidgetEditTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: UMG parity rename tool for button, text block, and widget variable edits with binding preservation.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("widgetBlueprintPath"), TEXT("oldName"), TEXT("newName") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("widgetBlueprintPath"), MakeStringProperty(TEXT("Widget Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("widgetName"), MakeStringProperty(TEXT("Widget name to move within its parent panel."), FString()));
+				Properties->SetObjectField(TEXT("newIndex"), MakeNumberProperty(TEXT("New zero-based child index inside the parent panel."), 0.0));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.widget_reorder_child"),
+					TEXT("Reorder Widget"),
+					TEXT("Moves a UMG widget to a new sibling index inside its parent panel so layout order can be edited by name."),
+					TEXT("widget"),
+					TEXT("UnrealMcpWidgetEditTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: UMG hierarchy editing parity tool for reordering children in panel widgets.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("widgetBlueprintPath"), TEXT("widgetName"), TEXT("newIndex") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("widgetBlueprintPath"), MakeStringProperty(TEXT("Widget Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("sourceName"), MakeStringProperty(TEXT("Widget name to duplicate."), FString()));
+				Properties->SetObjectField(TEXT("newName"), MakeStringProperty(TEXT("Optional requested duplicate name; a suffix is added if needed."), FString()));
+				Properties->SetObjectField(TEXT("includeSubtree"), MakeBoolProperty(TEXT("Whether to duplicate child widgets recursively."), true));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.widget_duplicate"),
+					TEXT("Duplicate Widget"),
+					TEXT("Duplicates a UMG widget, optionally including its child subtree, and assigns unique names for quick layout iteration."),
+					TEXT("widget"),
+					TEXT("UnrealMcpWidgetEditTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: UMG parity duplicate tool for copying buttons, text blocks, panels, and their designer subtree.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("widgetBlueprintPath"), TEXT("sourceName") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("widgetBlueprintPath"), MakeStringProperty(TEXT("Widget Blueprint asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("widgetName"), MakeStringProperty(TEXT("Widget name to delete."), FString()));
+				Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Delete even when widget bindings, bound events, or animation references exist."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.widget_delete"),
+					TEXT("Delete Widget"),
+					TEXT("Deletes a UMG widget subtree after checking binding and graph references; force is required when references would break."),
+					TEXT("widget"),
+					TEXT("UnrealMcpWidgetEditTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: UMG parity delete tool with binding/reference refusal unless force=true.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("widgetBlueprintPath"), TEXT("widgetName") }));
+			}
+		}
+
+		void RegisterMaterialInstanceMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("contentRoot"), MakeStringProperty(TEXT("Content Browser root to search for material instances."), TEXT("/Game")));
+				Properties->SetObjectField(TEXT("recursive"), MakeBoolProperty(TEXT("Whether to include child folders."), true));
+				Properties->SetObjectField(TEXT("classFilter"), MakeStringProperty(TEXT("Optional class path or class-name substring filter."), FString()));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum material instances to return."), 200.0));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.material_instance_list"),
+					TEXT("List Material Instances"),
+					TEXT("Lists Material Instance assets under a content path with parent material and class metadata for parameter-edit discovery."),
+					TEXT("material"),
+					TEXT("UnrealMcpMaterialInstanceTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: read-only material instance discovery tool for workflows like finding the instance to make a mesh redder.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("materialInstancePath"), MakeStringProperty(TEXT("Material Instance asset path to inspect."), FString()));
+				Properties->SetObjectField(TEXT("includeInherited"), MakeBoolProperty(TEXT("Include inherited parent parameter values as fromParent=true."), true));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.material_instance_get_parameters"),
+					TEXT("Get Material Parameters"),
+					TEXT("Reads scalar, vector, texture, and static switch parameters from a Material Instance, including inherited values when requested."),
+					TEXT("material"),
+					TEXT("UnrealMcpMaterialInstanceTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: read-only material parameter inspection before safe scalar or vector edits.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("materialInstancePath") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("materialInstancePath"), MakeStringProperty(TEXT("Material Instance Constant asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("parameterName"), MakeStringProperty(TEXT("Scalar parameter name to set."), FString()));
+				Properties->SetObjectField(TEXT("value"), MakeNumberProperty(TEXT("New scalar value. Must be a JSON number, not a string."), 1.0));
+				Properties->SetObjectField(TEXT("save"), MakeBoolProperty(TEXT("Whether to save the Material Instance package after editing."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.material_instance_set_scalar"),
+					TEXT("Set Material Scalar"),
+					TEXT("Sets one scalar parameter on a Material Instance Constant with strict numeric input and previous-value readback."),
+					TEXT("material"),
+					TEXT("UnrealMcpMaterialInstanceTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: type-safe material scalar setter for brightness, roughness, metallic, opacity, and similar numeric edits.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("materialInstancePath"), TEXT("parameterName"), TEXT("value") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("materialInstancePath"), MakeStringProperty(TEXT("Material Instance Constant asset path to edit."), FString()));
+				Properties->SetObjectField(TEXT("parameterName"), MakeStringProperty(TEXT("Vector parameter name to set."), FString()));
+				Properties->SetObjectField(TEXT("value"), MakeLinearColorValueSchema());
+				Properties->SetObjectField(TEXT("save"), MakeBoolProperty(TEXT("Whether to save the Material Instance package after editing."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.material_instance_set_vector"),
+					TEXT("Set Material Vector"),
+					TEXT("Sets one RGBA vector parameter on a Material Instance Constant, useful for color edits like making a material redder."),
+					TEXT("material"),
+					TEXT("UnrealMcpMaterialInstanceTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: type-safe material vector setter for color, tint, emissive color, and make-this-material-redder workflows.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("materialInstancePath"), TEXT("parameterName"), TEXT("value") }));
+			}
+		}
+
+		void RegisterScaffoldMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("recipeName"), MakeStringProperty(TEXT("Recipe name: first_person_ground_character, widget_hud, or mcp_self_extension_pipeline."), TEXT("first_person_ground_character")));
+			Properties->SetObjectField(TEXT("rootPath"), MakeStringProperty(TEXT("Content Browser root used in generated example tool calls."), TEXT("/Game/UEvolveRecipes")));
+			Properties->SetObjectField(TEXT("taskName"), MakeStringProperty(TEXT("Optional human-readable task label to store with the recipe."), FString()));
+			Properties->SetObjectField(TEXT("writeMemory"), MakeBoolProperty(TEXT("Whether to write this recipe into project memory for Chat continuation."), true));
+			Properties->SetObjectField(TEXT("memoryKey"), MakeStringProperty(TEXT("Project memory key to write when writeMemory=true."), TEXT("chat.active_task")));
+			Properties->SetObjectField(TEXT("includeToolCalls"), MakeBoolProperty(TEXT("Whether to include example tool-call JSON for the recipe."), true));
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+
+			FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+				TEXT("unreal.scaffold_recipe"),
+				TEXT("Scaffold High-Level Recipe"),
+				TEXT("Prepares a bounded high-level editor recipe with ordered tools, verification gates, and optional chat.active_task memory handoff."),
+				TEXT("scaffold"),
+				TEXT("UnrealMcpScaffoldTools.cpp"),
+				EUnrealMcpToolRisk::Low);
+			Descriptor.bRequiresWrite = true;
+			Descriptor.bRequiresProjectMemory = true;
+			Descriptor.bPreflightSupport = true;
+			Descriptor.bPostcheckSupport = true;
+			Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+			Descriptor.Reason = TEXT("Descriptor: high-level recipe scaffold that writes optional continuation memory and reduces long-loop tool exploration.");
+			Registrar.Add(Descriptor, Schema);
+		}
+
+		void RegisterSkillSessionMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			TSharedPtr<FJsonObject> LabelProperty = MakeStringProperty(TEXT("User-set label for the current launch session; empty clears."), FString());
+			LabelProperty->SetNumberField(TEXT("maxLength"), 2000);
+
+			TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+			Properties->SetObjectField(TEXT("label"), LabelProperty);
+
+			TArray<TSharedPtr<FJsonValue>> Required;
+			TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+			Schema->SetObjectField(TEXT("properties"), Properties);
+			Schema->SetArrayField(TEXT("required"), Required);
+
+			FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+				TEXT("unreal.chat_label_active_task"),
+				TEXT("Label Active Chat Task"),
+				TEXT("Sets or clears a user-visible label for subsequent launch-session ActivityLog events."),
+				TEXT("skills"),
+				TEXT("UnrealMcpSkillTools.cpp"),
+				EUnrealMcpToolRisk::Low);
+			Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+			Descriptor.Reason = TEXT("Descriptor: low-risk launch-session label setter used to tag subsequent ActivityLog events.");
+			Registrar.Add(Descriptor, Schema);
+		}
+
+		void RegisterTaskAtlasMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> OverrideProperties = MakeShared<FJsonObject>();
+				TSharedPtr<FJsonObject> OrdinalProperty = MakeIntegerProperty(TEXT("0-based step ordinal to override."), 0);
+				OrdinalProperty->SetNumberField(TEXT("minimum"), 0.0);
+				OverrideProperties->SetObjectField(TEXT("ordinal"), OrdinalProperty);
+				OverrideProperties->SetObjectField(TEXT("toolName"), MakeStringProperty(TEXT("Optional expected tool name for the step."), FString()));
+				OverrideProperties->SetObjectField(TEXT("argumentsJson"), MakeStringProperty(TEXT("Closed-schema JSON string parsed into override arguments for this step."), TEXT("{}")));
+				TSharedPtr<FJsonObject> OverrideItemSchema = MakeSchemaWithRequired(OverrideProperties, TArray<FString>{ TEXT("ordinal"), TEXT("argumentsJson") });
+
+				TSharedPtr<FJsonObject> OverrideArray = MakeShared<FJsonObject>();
+				OverrideArray->SetStringField(TEXT("type"), TEXT("array"));
+				OverrideArray->SetStringField(TEXT("description"), TEXT("Optional strict override bridge for developer tools. Each entry carries JSON as a string."));
+				OverrideArray->SetObjectField(TEXT("items"), OverrideItemSchema);
+
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("taskId"), MakeStringProperty(TEXT("Task Atlas task id to classify and convert."), FString()));
+				Properties->SetObjectField(TEXT("preferDocumentOnly"), MakeBoolProperty(TEXT("Dry-run/document-only mode. When true, never writes Tools/UnrealMcpPyTools and writes/returns a markdown draft instead."), false));
+				Properties->SetObjectField(TEXT("forceWriteEvenIfBlocked"), MakeBoolProperty(TEXT("Developer escape hatch. Still requires AssistantRun approval when invoked by AI; UI must not set this."), false));
+				Properties->SetObjectField(TEXT("overrideStepArgs"), OverrideArray);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_atlas_make_composite"),
+					TEXT("Make Task Atlas Composite"),
+					TEXT("Turns a Task Atlas task into a generated preview composite Python user tool or a document-only draft based on replay eligibility."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 Task Atlas Make Tool Set MCP wrapper over TaskAtlasService::MakeComposite.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("taskId") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("toolName"), MakeUserToolNameProperty(TEXT("Generated user tool name to delete. Only Task Atlas generated tools are eligible.")));
+				Properties->SetObjectField(TEXT("confirm"), MakeConstBoolProperty(TEXT("Must be true. The tool refuses deletion without explicit confirmation."), true));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("When true, report the target dir and reload effect without deleting. confirm=true is still required."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_atlas_delete_made_tool"),
+					TEXT("Delete Task Atlas Made Tool"),
+					TEXT("Removes a Task Atlas generated user composite and reloads the user registry."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 Task Atlas generated composite deletion wrapper with confirm guard.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("toolName"), TEXT("confirm") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("includeStale"), MakeBoolProperty(TEXT("Include generated dirs that are not currently loaded in the user registry."), true));
+				Properties->SetObjectField(TEXT("includeFailureMarkers"), MakeBoolProperty(TEXT("Include generated_smoke_failed and MakeToolSetFailures diagnostic links when present."), true));
+				Properties->SetObjectField(TEXT("sourceTaskId"), MakeStringProperty(TEXT("Optional exact task id filter. Empty means no filter."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_atlas_list_made_tools"),
+					TEXT("List Task Atlas Made Tools"),
+					TEXT("Lists Task Atlas generated user composites from the user-tool registry roots for diagnostics and UI polling."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 read-only Task Atlas generated composite listing wrapper.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("text"), MakeStringProperty(TEXT("User prompt to inject into the editor Chat Panel as if the user typed it and pressed Enter."), FString()));
+				Properties->SetObjectField(TEXT("sessionId"), MakeStringProperty(TEXT("Optional ActivityLog sessionId. Default: current process session."), FString()));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("When true, report whether a panel is available without actually queuing the prompt."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.chat_inject_user_input"),
+					TEXT("Inject Chat Panel User Input"),
+					TEXT("Inject a user prompt into the editor Chat Panel as if the user typed Enter, triggering the normal AI assistant flow."),
+					TEXT("editor"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/ChatSync.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 R4 chunk 9 CLI to editor Chat Panel user-input injection.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("text") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				TSharedPtr<FJsonObject> CountProperty = MakeIntegerProperty(TEXT("Maximum chat history entries to return."), 20);
+				CountProperty->SetNumberField(TEXT("minimum"), 1.0);
+				CountProperty->SetNumberField(TEXT("maximum"), 100.0);
+				Properties->SetObjectField(TEXT("count"), CountProperty);
+				Properties->SetObjectField(TEXT("sessionId"), MakeStringProperty(TEXT("Optional ActivityLog sessionId. Default: current process session."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.chat_history_tail"),
+					TEXT("Tail Chat Panel History"),
+					TEXT("Read the last N entries from the editor Chat Panel persisted history (Saved/UnrealMcp/ChatHistory.json)."),
+					TEXT("editor"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/ChatSync.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 R4 chunk 9 read-only editor Chat Panel history tail.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				TSharedPtr<FJsonObject> CountProperty = MakeIntegerProperty(TEXT("Maximum tool_call events to return."), 20);
+				CountProperty->SetNumberField(TEXT("minimum"), 1.0);
+				CountProperty->SetNumberField(TEXT("maximum"), 100.0);
+				Properties->SetObjectField(TEXT("count"), CountProperty);
+				Properties->SetObjectField(TEXT("sessionId"), MakeStringProperty(TEXT("Optional ActivityLog sessionId. Default: current process session."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.chat_tool_log_tail"),
+					TEXT("Tail Chat Tool Log"),
+					TEXT("Read the last N tool_call events from the current ActivityLog session (the events shown beside the chat dialog)."),
+					TEXT("editor"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/ChatSync.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 R4 chunk 9 read-only editor Chat tool log tail.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("taskId"), MakeStringProperty(TEXT("Task Atlas task id to promote."), FString()));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("When true, report source/target paths and refresh plan without writing KnowledgeSources."), false));
+				Properties->SetObjectField(TEXT("refreshIndex"), MakeBoolProperty(TEXT("Run knowledge_index_refresh after writing the source."), true));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_atlas_promote_to_rag"),
+					TEXT("Promote Task Atlas Task To RAG"),
+					TEXT("Promotes a Task Atlas task or draft into a RAG knowledge source and refreshes the knowledge index on real writes."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 Task Atlas RAG promotion wrapper over TaskAtlasService::PromoteToRag.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("taskId") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("toolName"), MakeUserToolNameProperty(TEXT("Generated composite user tool to smoke.")));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("When true, validate presence and show smoke args without executing the user tool."), true));
+				Properties->SetObjectField(TEXT("acceptChangedHashes"), MakeBoolProperty(TEXT("Forwarded to user registry reload only when a real pre-smoke reload is required. Default must remain false."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_atlas_smoke_made_tool"),
+					TEXT("Smoke Task Atlas Made Tool"),
+					TEXT("Runs or previews a smoke test for a generated composite user tool and records failure diagnostics without deleting the tool."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 Task Atlas generated composite smoke wrapper over TaskAtlasService::SmokeMadeTool.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("toolName") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("kind"), MakeEnumStringProperty(TEXT("Activity annotation kind."), TEXT("user_intent"), TArray<FString>{ TEXT("user_intent"), TEXT("ai_summary") }));
+				Properties->SetObjectField(TEXT("content"), MakeStringProperty(TEXT("Annotation content to write into ActivityLog."), FString()));
+				Properties->SetObjectField(TEXT("sessionId"), MakeStringProperty(TEXT("Optional ActivityLog sessionId. Defaults to the current launch session."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.activity_log_annotate"),
+					TEXT("Annotate Activity Log"),
+					TEXT("Writes a user_intent or ai_summary ActivityLog event for Task Atlas extraction and refreshes local task JSON files."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.17 Task Atlas annotation tool for user intent and assistant completion summaries.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("kind"), TEXT("content") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("filter"), MakeEnumStringProperty(TEXT("Optional task filter."), TEXT("all"), TArray<FString>{ TEXT("all"), TEXT("success"), TEXT("failed"), TEXT("unrated"), TEXT("pinned") }));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum tasks to return."), 50.0));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_list"),
+					TEXT("List Task Atlas Tasks"),
+					TEXT("Refreshes Task Atlas JSON files from ActivityLog and lists extracted tasks with rating, pin state, and critical path."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.17 Task Atlas read-only task listing with optional rating/pin filters.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("taskId"), MakeStringProperty(TEXT("Task Atlas taskId to describe."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_describe"),
+					TEXT("Describe Task Atlas Task"),
+					TEXT("Returns the full persisted Task Atlas JSON document plus task path/status fields for one taskId."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.17 Task Atlas read-only task detail lookup.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("taskId") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("taskId"), MakeStringProperty(TEXT("Task Atlas taskId to rate."), FString()));
+				Properties->SetObjectField(TEXT("rating"), MakeEnumStringProperty(TEXT("New task rating."), TEXT("unrated"), TArray<FString>{ TEXT("success"), TEXT("failed"), TEXT("unrated") }));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_rate"),
+					TEXT("Rate Task Atlas Task"),
+					TEXT("Persists a success, failed, or unrated rating for an existing Task Atlas task and appends a task_rating ActivityLog event."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.17 Task Atlas user rating tool with local JSON persistence.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("taskId"), TEXT("rating") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("taskId"), MakeStringProperty(TEXT("Task Atlas taskId to pin or unpin."), FString()));
+				Properties->SetObjectField(TEXT("pinned"), MakeBoolProperty(TEXT("Whether the task should be pinned."), true));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_pin"),
+					TEXT("Pin Task Atlas Task"),
+					TEXT("Persists a pinned state for an existing Task Atlas task and appends a task_pin_change ActivityLog event with a critical path snapshot."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.17 Task Atlas pinning tool for workflow curation.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("taskId"), TEXT("pinned") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("sessionId"), MakeStringProperty(TEXT("Optional Task Atlas sessionId filter."), FString()));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum placeholder-label tasks to process. Defaults to 25."), 25.0));
+				Properties->SetObjectField(TEXT("force"), MakeBoolProperty(TEXT("Broaden candidate discovery while preserving pinned and user-edited safeguards."), false));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview eligible tasks without calling the provider or writing task JSON."), false));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.task_label_backfill"),
+					TEXT("Backfill Task Atlas Labels"),
+					TEXT("Uses the configured Anthropic Messages provider to infer short labels for unpinned Task Atlas tasks that still have Session timestamp placeholders."),
+					TEXT("task-atlas"),
+					TEXT("UnrealMcpTaskAtlasTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/TaskAtlas.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.19 Task Atlas LLM retrospective labeling with conservative pin and user-label safeguards.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+		}
+
+		void RegisterVerificationMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("filter"), MakeStringProperty(TEXT("Optional case-insensitive substring filter matched against fullName and displayName."), FString()));
+				Properties->SetObjectField(TEXT("includeDetails"), MakeBoolProperty(TEXT("Include category and best-effort requirement metadata."), false));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum automation tests to return."), 200.0));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.automation_list"),
+					TEXT("List Automation Tests"),
+					TEXT("Lists runnable Unreal Automation Framework tests with canonical fullName, display name, flags, and optional details."),
+					TEXT("verification"),
+					TEXT("UnrealMcpAutomationTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.20 C1a verification foundation read-only automation test discovery.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("fullName"), MakeStringProperty(TEXT("Exact canonical FAutomationTestFramework test name to run."), FString()));
+				Properties->SetObjectField(TEXT("timeoutSeconds"), MakeNumberProperty(TEXT("Wall-clock timeout before reports surface timed_out and stale recovery can later free the slot."), 120.0));
+				Properties->SetObjectField(TEXT("tags"), MakeStringArrayProperty(TEXT("Caller metadata echoed into the run report; not passed to UE Automation filters.")));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.automation_run"),
+					TEXT("Run Automation Test"),
+					TEXT("Queues one Unreal Automation Framework test and returns immediately with a runId for polling."),
+					TEXT("verification"),
+					TEXT("UnrealMcpAutomationTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.20 C1a verification foundation async single automation test runner with state-file reports.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("fullName") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("runId"), MakeStringProperty(TEXT("Automation runId returned by unreal.automation_run."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.automation_report"),
+					TEXT("Get Automation Run Report"),
+					TEXT("Returns the current or persisted report for an async automation test run."),
+					TEXT("verification"),
+					TEXT("UnrealMcpAutomationTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.20 C1a verification foundation read-only automation run polling/report tool.");
+				Registrar.Add(Descriptor, MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("runId") }));
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("mapPath"), MakeStringProperty(TEXT("Optional /Game/... UWorld asset path to open before PIE smoke."), FString()));
+				TSharedPtr<FJsonObject> TimeoutProperty = MakeNumberProperty(TEXT("Total wall-clock timeout. Defaults to 60 and is clamped to 10..300."), 60.0);
+				TimeoutProperty->SetNumberField(TEXT("minimum"), 10.0);
+				TimeoutProperty->SetNumberField(TEXT("maximum"), 300.0);
+				Properties->SetObjectField(TEXT("timeoutSeconds"), TimeoutProperty);
+				TSharedPtr<FJsonObject> AliveProperty = MakeNumberProperty(TEXT("PIE alive-window duration. Defaults to 5 and is clamped to 1..30; must be less than timeoutSeconds."), 5.0);
+				AliveProperty->SetNumberField(TEXT("minimum"), 1.0);
+				AliveProperty->SetNumberField(TEXT("maximum"), 30.0);
+				Properties->SetObjectField(TEXT("aliveWindowSeconds"), AliveProperty);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.pie_smoke"),
+					TEXT("Run PIE Smoke"),
+					TEXT("Queues a Play In Editor smoke verification run, observes BeginPIE/alive-window/EndPIE, then reports through automation_report."),
+					TEXT("verification"),
+					TEXT("UnrealMcpPieSmokeTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.22 C1b PIE smoke runtime verification with shared automation_report polling.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.verify_player_controls"),
+					TEXT("Verify Player Controls"),
+					TEXT("Verifies PIE possession, pawn class, camera/spring arm components, and Jump/move/look binding existence without injecting input or checking movement deltas."),
+					TEXT("verification"),
+					TEXT("UnrealMcpPieSmokeTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresLock = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Tools/UnrealMcpToolDocs/verification/verify_player_controls.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.27.1 core runtime setup verifier that waits privately for BeginPIE and performs existence-only control checks.");
+				Registrar.Add(Descriptor, MakeVerifyPlayerControlsSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.pie_input_probe"),
+					TEXT("Probe PIE Input Movement"),
+					TEXT("Starts or polls an asynchronous PIE input probe that injects one gameplay input profile on the core ticker and reports movement or rotation deltas."),
+					TEXT("verification"),
+					TEXT("UnrealMcpPieSmokeTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresLock = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.28 runtime verification probe for real PIE movement or look deltas without editor tick pumping.");
+				Registrar.Add(Descriptor, MakePieInputProbeSchema());
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.verify_viewport_widgets"),
+					TEXT("Verify Viewport Widgets"),
+					TEXT("Lists UUserWidget instances that are currently in the PIE viewport, optionally filtered by generated widget class path."),
+					TEXT("verification"),
+					TEXT("UnrealMcpPieSmokeTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.28 read-only runtime verifier for on-screen PIE UMG widgets.");
+				Registrar.Add(Descriptor, MakeVerifyViewportWidgetsSchema());
+			}
+
+			{
+				const TArray<FString> DiagnosticClasses = {
+					TEXT("compile"),
+					TEXT("map_check"),
+					TEXT("content"),
+					TEXT("automation"),
+					TEXT("log_warning"),
+					TEXT("log_error")
+				};
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("since"), MakeStringProperty(TEXT("Optional ISO-8601 UTC lower bound; entries with ts >= since are returned."), FString()));
+
+				TSharedPtr<FJsonObject> ClassesProperty = MakeStringArrayProperty(TEXT("Optional diagnostic class filter."));
+				TSharedPtr<FJsonObject> ClassItems = MakeShared<FJsonObject>();
+				ClassItems->SetStringField(TEXT("type"), TEXT("string"));
+				ClassItems->SetArrayField(TEXT("enum"), MakeEnumValues(DiagnosticClasses));
+				ClassesProperty->SetObjectField(TEXT("items"), ClassItems);
+				Properties->SetObjectField(TEXT("classes"), ClassesProperty);
+
+				TSharedPtr<FJsonObject> LimitProperty = MakeNumberProperty(TEXT("Maximum diagnostics entries to return. Defaults to 200 and is clamped to 1..1000."), 200.0);
+				LimitProperty->SetNumberField(TEXT("minimum"), 1.0);
+				LimitProperty->SetNumberField(TEXT("maximum"), 1000.0);
+				Properties->SetObjectField(TEXT("limit"), LimitProperty);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.editor_diagnostics"),
+					TEXT("Read Editor Diagnostics"),
+					TEXT("Returns recent warning, error, and fatal Output Log diagnostics from an in-memory listener-backed ring buffer."),
+					TEXT("verification"),
+					TEXT("UnrealMcpDiagnosticsTools.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/Verification.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.21 build diagnostics ring buffer for Output Log warning/error/fatal events.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+		}
+
+		void RegisterSelfExtensionMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("includeToolJson"), MakeBoolProperty(TEXT("Include sanitized tool.json snippets. Do not include private captured args."), false));
+				Properties->SetObjectField(TEXT("includePythonSha"), MakeBoolProperty(TEXT("Include python handler SHA-256 where available."), true));
+				Properties->SetObjectField(TEXT("toolName"), MakeStringProperty(TEXT("Optional exact user tool name filter. Empty means all."), FString()));
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.user_registry_introspect"),
+					TEXT("Introspect User Registry"),
+					TEXT("Inspects user registry state, generated source metadata, handler hashes, lifecycle state, and rejection reasons without exposing private captured args."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpToolDispatcher.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/SelfExtensionPipeline.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.31 visible read-only user registry introspection wrapper over TaskAtlasService::IntrospectUserRegistry.");
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.mcp_tool_audit"),
+					TEXT("Audit MCP Tools"),
+					TEXT("Read-only audit of registered MCP tools, handlers, README documentation, and AI schema compatibility."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionTools.cpp")),
+				MakeObjectSchema());
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("acceptChangedHashes"), MakeBoolProperty(TEXT("If true, accept main.py edits that change sha256 and record the new hash in the user overlay."), false));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Walk and categorize project-local user Python tools without mutating the overlay registry."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_user_registry_reload"),
+					TEXT("Reload User Tool Registry"),
+					TEXT("Rescans project-local user Python tools at Tools/UnrealMcpPyTools and hot-reloads main.py via the Python bridge without an editor restart."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpUserRegistryReloadTool.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.DocsPath = TEXT("Tools/UnrealMcpSkills/mcp-self-extension/SKILL.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.26 user-extension overlay refresh control tool for project-local Python tools.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("toolName"), MakeStringProperty(TEXT("Loaded user tool name to smoke-test, for example user.my_python_tool."), FString()));
+				Properties->SetObjectField(TEXT("dryRunArgs"), MakeStringProperty(
+					TEXT("Optional JSON object (encoded as a string) of args forwarded to execute(args); dryRun=true is always injected."),
+					FString()));
+				Properties->SetObjectField(TEXT("timeoutSeconds"), MakeNumberProperty(TEXT("Bounded execution timeout in seconds. Timeout detects late completion but cannot safely interrupt wedged embedded Python execution."), 10.0));
+				TSharedPtr<FJsonObject> Schema = MakeSchemaWithRequired(Properties, TArray<FString>{ TEXT("toolName") });
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_user_tool_smoke"),
+					TEXT("Smoke-test User Tool"),
+					TEXT("Invokes a loaded user Python tool with dryRun args under a bounded timeout and reports smoke_passed or smoke_failed lifecycle. Timeout detection does not safely interrupt wedged in-process Python."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpUserToolSmokeTool.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.DocsPath = TEXT("Tools/UnrealMcpSkills/mcp-self-extension/SKILL.md");
+				Descriptor.Reason = TEXT("Descriptor: v0.26 user-extension smoke verification control tool before assistants claim a user Python tool is callable.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("includeDetails"), MakeBoolProperty(TEXT("Include full per-check details and recommended fixes when available."), false));
+				Properties->SetObjectField(TEXT("refresh"), MakeBoolProperty(TEXT("Run checks now instead of using a recent cached result."), false));
+				Properties->SetObjectField(TEXT("deepScanEnginePlugins"), MakeBoolProperty(TEXT("Opt in to a bounded two-level scan under Engine/Plugins for duplicate UnrealMcp copies."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.install_doctor"),
+					TEXT("Run Install Doctor"),
+					TEXT("Runs read-only runtime install checks for registry mirrors, schemas, Python plugin state, MCP ports, and duplicate UnrealMcp plugin copies."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpInstallDoctor.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Core;
+				Descriptor.DocsPath = TEXT("Docs/DeploymentTroubleshooting.md");
+				Descriptor.Reason = TEXT("Descriptor: read-only runtime install diagnostics for mirrors, plugin state, ports, and duplicate plugin copies.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("toolName"), MakeStringProperty(TEXT("MCP tool name to export. Portable exports require a matching scaffold under Tools/UnrealMcpToolScaffolds or Saved/UnrealMcp/TestScaffolds."), FString()));
+				Properties->SetObjectField(TEXT("version"), MakeStringProperty(TEXT("Optional package version suffix. Defaults to a UTC timestamp."), FString()));
+				Properties->SetObjectField(TEXT("packagePath"), MakeStringProperty(TEXT("Optional project-relative package zip path. Defaults to Saved/UnrealMcp/Packages/<toolName>-<version>.zip."), FString()));
+				Properties->SetObjectField(TEXT("scaffoldDir"), MakeStringProperty(TEXT("Deprecated compatibility field. Portable exports resolve the reviewed scaffold roots automatically."), FString()));
+				Properties->SetObjectField(TEXT("outputRoot"), MakeStringProperty(TEXT("Deprecated compatibility field. Portable exports resolve Tools/UnrealMcpToolScaffolds and Saved/UnrealMcp/TestScaffolds automatically."), TEXT("Tools/UnrealMcpToolScaffolds")));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview package manifest and entries without writing the zip."), true));
+				Properties->SetObjectField(TEXT("allowRegistryOnly"), MakeBoolProperty(TEXT("Expert mode: allow exporting a registry-only package when no portable scaffold exists. Import refuses this package unless acceptRegistryOnly=true."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("toolName")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.tools.export_package"),
+					TEXT("Export Tool Package"),
+					TEXT("Exports a scaffold-backed MCP tool to a portable zip package under Saved/UnrealMcp/Packages/; expert flag allowRegistryOnly=true emits a non-portable registry-only package that import refuses by default."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpToolPackager.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/SelfExtensionPipeline.md#tool-sharing");
+				Descriptor.Reason = TEXT("Descriptor: writes reviewed tool-sharing packages under Saved/UnrealMcp/Packages without mutating source files.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), MakeShared<FJsonObject>());
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.tools.list_exportable"),
+					TEXT("List Exportable Tools"),
+					TEXT("Lists registered MCP tools that qualify as scaffold-backed and can be cleanly exported via unreal.tools.export_package."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpToolPackager.cpp"),
+					EUnrealMcpToolRisk::ReadOnly);
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/SelfExtensionPipeline.md#tool-sharing");
+				Descriptor.Reason = TEXT("Descriptor: read-only package picker helper for scaffold-backed user-generated tools.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("packagePath"), MakeStringProperty(TEXT("Project-relative or absolute tool package zip path."), FString()));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Validate and preview the import plan without mutating registry, scaffold, or test files."), true));
+				Properties->SetObjectField(TEXT("overwriteScaffold"), MakeBoolProperty(TEXT("Allow scaffold files from the package to overwrite existing scaffold files."), false));
+				Properties->SetObjectField(TEXT("acceptRegistryOnly"), MakeBoolProperty(TEXT("Expert mode: allow importing a registry-only package whose handler implementation must already exist locally."), false));
+				Properties->SetObjectField(TEXT("skipLock"), MakeBoolProperty(TEXT("Testing-only escape hatch for in-process test execution; normal Chat use should leave this false."), false));
+				TArray<TSharedPtr<FJsonValue>> Required;
+				Required.Add(MakeShared<FJsonValueString>(TEXT("packagePath")));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Schema->SetArrayField(TEXT("required"), Required);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.tools.import_package"),
+					TEXT("Import Tool Package"),
+					TEXT("Validates and imports a portable tool package zip into the local registry/scaffold/test tree; registry-only packages are refused unless caller explicitly opts in."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpToolPackager.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.DocsPath = TEXT("Docs/SelfExtensionPipeline.md#tool-sharing");
+				Descriptor.Reason = TEXT("Descriptor: mutates tool-sharing registry/scaffold/test assets only after package hash validation and extension-session locking.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			TSharedPtr<FJsonObject> WorkbenchProperties = MakeShared<FJsonObject>();
+			WorkbenchProperties->SetObjectField(TEXT("memoryKey"), MakeStringProperty(TEXT("Project memory key to highlight in pipeline/workbench status."), TEXT("mcp.extension.pipeline")));
+			WorkbenchProperties->SetObjectField(TEXT("includeBuildLogTail"), MakeBoolProperty(TEXT("Whether to include the latest build log tail."), false));
+			WorkbenchProperties->SetObjectField(TEXT("buildLogTailLines"), MakeNumberProperty(TEXT("Maximum latest build log tail lines."), 80.0));
+
+			TSharedPtr<FJsonObject> WorkbenchSchema = MakeObjectSchema();
+			WorkbenchSchema->SetObjectField(TEXT("properties"), WorkbenchProperties);
+
+			Registrar.Add(
+				MakeDescriptor(
+					TEXT("unreal.mcp_workbench_status"),
+					TEXT("MCP Workbench Status"),
+					TEXT("Read-only dashboard summary for self-extension health: tools, audit, memory, manifests, build/test artifacts, and supervisor status."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionTools.cpp")),
+				WorkbenchSchema);
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_build_game"),
+					TEXT("Build Game Target"),
+					TEXT("Runs Unreal Build Tool for the standalone game target, captures logs, parses errors, and writes build status memory."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionBuildTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresExternalProcess = true;
+				Descriptor.bRequiresProjectMemory = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Manual;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 4 UBT target matrix tool for standalone game compile coverage.");
+				Registrar.Add(Descriptor, MakeBuildTargetSchema(FApp::GetProjectName(), TEXT("mcp.extension.build_game")));
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_build_server"),
+					TEXT("Build Server Target"),
+					TEXT("Runs Unreal Build Tool for the dedicated-server target, captures logs, parses errors, and writes build status memory."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionBuildTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresExternalProcess = true;
+				Descriptor.bRequiresProjectMemory = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Manual;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 4 UBT target matrix tool for dedicated-server compile coverage.");
+				Registrar.Add(Descriptor, MakeBuildTargetSchema(FString::Printf(TEXT("%sServer"), FApp::GetProjectName()), TEXT("mcp.extension.build_server")));
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_build_client"),
+					TEXT("Build Client Target"),
+					TEXT("Runs Unreal Build Tool for the dedicated-client target, captures logs, parses errors, and writes build status memory."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionBuildTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresExternalProcess = true;
+				Descriptor.bRequiresProjectMemory = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Manual;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 4 UBT target matrix tool for dedicated-client compile coverage.");
+				Registrar.Add(Descriptor, MakeBuildTargetSchema(FString::Printf(TEXT("%sClient"), FApp::GetProjectName()), TEXT("mcp.extension.build_client")));
+			}
+
+			{
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_build_packaged"),
+					TEXT("Build Packaged Target"),
+					TEXT("Runs RunUAT BuildCookRun for a cooked packaged build under Saved/StagedBuilds or a project-local archive directory."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionBuildTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresExternalProcess = true;
+				Descriptor.bRequiresProjectMemory = true;
+				Descriptor.bRequiresLock = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Manual;
+				Descriptor.Reason = TEXT("Descriptor: v0.15 chunk 4 packaged BuildCookRun tool for full UAT build/cook/stage/package coverage.");
+				Registrar.Add(Descriptor, MakePackagedBuildSchema());
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("sourceRoot"), MakeStringProperty(TEXT("Optional project-Saved root containing fetched knowledge sources. Must remain inside the current project's Saved directory; defaults to Saved/UnrealMcp/KnowledgeSources."), FString()));
+				Properties->SetObjectField(TEXT("indexRoot"), MakeStringProperty(TEXT("Optional project-Saved output directory for the generated KnowledgeCard index. Must remain inside the current project's Saved directory; defaults to Saved/UnrealMcp/KnowledgeIndex."), FString()));
+				Properties->SetObjectField(TEXT("includeOfficialDocs"), MakeBoolProperty(TEXT("Include fetched official documentation documents.jsonl files."), true));
+				Properties->SetObjectField(TEXT("includePromotedSources"), MakeBoolProperty(TEXT("Include promoted local markdown sources such as Task Atlas RAG cards independently of official docs."), true));
+				Properties->SetObjectField(TEXT("includeVersionedDocs"), MakeBoolProperty(TEXT("Include versioned README/Docs markdown files."), true));
+				Properties->SetObjectField(TEXT("includeToolRegistry"), MakeBoolProperty(TEXT("Include visible ToolRegistry entries as searchable tool cards."), true));
+				Properties->SetObjectField(TEXT("includeActivityLog"), MakeBoolProperty(TEXT("Include local activity-log summary cards. Disabled by default because logs can contain project-specific context."), false));
+				Properties->SetObjectField(TEXT("includeSkills"), MakeBoolProperty(TEXT("Include promoted project skills as searchable cards."), true));
+				Properties->SetObjectField(TEXT("allowEmptyIndex"), MakeBoolProperty(TEXT("Allow an explicitly empty index only when indexRoot is explicitly under Saved/UnrealMcp/Tests. By default, an empty refresh preserves the last-known-good index."), false));
+				Properties->SetObjectField(TEXT("skipLowContent"), MakeBoolProperty(TEXT("Skip source rows flagged as low-content by the docs fetcher."), true));
+				Properties->SetObjectField(TEXT("maxCards"), MakeNumberProperty(TEXT("Maximum KnowledgeCards to write."), 2000.0));
+				Properties->SetObjectField(TEXT("maxChunkChars"), MakeNumberProperty(TEXT("Maximum text characters per card chunk."), 1800.0));
+				Properties->SetObjectField(TEXT("chunkOverlapChars"), MakeNumberProperty(TEXT("Overlapping characters between adjacent chunks."), 160.0));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview source/card counts without writing index files."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.knowledge_index_refresh"),
+					TEXT("Refresh Knowledge Index"),
+					TEXT("Rebuilds the local Saved/UnrealMcp/KnowledgeIndex/ JSONL index from fetched docs plus visible tool metadata for RAG retrieval; call after upstream docs change or after a registry-changing chunk."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpKnowledgeTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: writes local Saved/UnrealMcp KnowledgeCard indexes so Chat can retrieve docs and tool guidance without expanding prompt context.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				const TArray<FString> KnowledgeSourceKinds = {
+					TEXT("tool-registry"),
+					TEXT("versioned-doc"),
+					TEXT("official-docs"),
+					TEXT("skill"),
+					TEXT("runtime-memory"),
+					TEXT("activity-log"),
+					TEXT("test-fixture"),
+					TEXT("unknown")
+				};
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("query"), MakeStringProperty(TEXT("Search query for local KnowledgeCards."), FString()));
+				Properties->SetObjectField(TEXT("categories"), MakeStringArrayProperty(TEXT("Optional KnowledgeCard categories to include.")));
+				TSharedPtr<FJsonObject> SourceKindsProperty = MakeStringArrayProperty(TEXT("Optional sourceKind values to include."));
+				TSharedPtr<FJsonObject> SourceKindItems = MakeShared<FJsonObject>();
+				SourceKindItems->SetStringField(TEXT("type"), TEXT("string"));
+				SourceKindItems->SetArrayField(TEXT("enum"), MakeEnumValues(KnowledgeSourceKinds));
+				SourceKindsProperty->SetObjectField(TEXT("items"), SourceKindItems);
+				Properties->SetObjectField(TEXT("sourceKinds"), SourceKindsProperty);
+				Properties->SetObjectField(TEXT("groupByKind"), MakeBoolProperty(TEXT("Group results by sourceKind instead of returning one flat results array."), false));
+				Properties->SetObjectField(TEXT("indexRoot"), MakeStringProperty(TEXT("Optional index directory inside the current project's Saved directory. Defaults to Saved/UnrealMcp/KnowledgeIndex."), FString()));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum search results."), 8.0));
+				Properties->SetObjectField(TEXT("maxExcerptChars"), MakeNumberProperty(TEXT("Maximum excerpt characters per result."), 420.0));
+				Properties->SetObjectField(TEXT("includeText"), MakeBoolProperty(TEXT("Include full card text in results. Off by default to keep Chat context compact."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.knowledge_search"),
+						TEXT("Search Knowledge Index"),
+						TEXT("Reads the local KnowledgeCard index and returns compact source-linked cards; use for planning, tool choice, and verification, and call unreal.knowledge_index_refresh first if the index is missing."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpKnowledgeTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("task"), MakeStringProperty(TEXT("Natural-language task to map to existing tools and workflows."), FString()));
+				Properties->SetObjectField(TEXT("indexRoot"), MakeStringProperty(TEXT("Optional knowledge index directory inside the current project's Saved directory for test isolation. Defaults to Saved/UnrealMcp/KnowledgeIndex."), FString()));
+				Properties->SetObjectField(TEXT("riskMax"), MakeStringProperty(TEXT("Maximum risk to recommend: read_only, low, medium, high, or critical."), TEXT("critical")));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum tool recommendations."), 8.0));
+				Properties->SetObjectField(TEXT("includeKnowledge"), MakeBoolProperty(TEXT("Include top matching KnowledgeCards when the index exists."), true));
+				Properties->SetObjectField(TEXT("includeWorkflowDraft"), MakeBoolProperty(TEXT("Include a lightweight workflow draft using preview/search/tool/verify gates."), true));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.tool_recommend"),
+						TEXT("Recommend MCP Tools"),
+						TEXT("Given a task description, returns ranked tool suggestions from the local registry plus knowledge index."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpKnowledgeTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("task"), MakeStringProperty(TEXT("Natural-language task to analyze for tool coverage gaps."), FString()));
+				Properties->SetObjectField(TEXT("riskMax"), MakeStringProperty(TEXT("Maximum existing-tool risk to consider: read_only, low, medium, high, or critical."), TEXT("critical")));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum existing tool recommendations to include."), 6.0));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.tool_gap_analyze"),
+						TEXT("Analyze MCP Tool Gap"),
+						TEXT("Detects functional gaps in the current tool surface relative to a workflow goal as a read-only audit."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpKnowledgeTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("task"), MakeStringProperty(TEXT("Natural-language task to convert into a recommended MCP workflow draft."), FString()));
+				Properties->SetObjectField(TEXT("riskMax"), MakeStringProperty(TEXT("Maximum tool risk to include in recommendations: read_only, low, medium, high, or critical."), TEXT("critical")));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Maximum recommended task-specific tools to include as skipped placeholder steps."), 5.0));
+				Properties->SetObjectField(TEXT("includeKnowledge"), MakeBoolProperty(TEXT("Include knowledge_search as an early workflow step."), true));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Set the generated workflow_run draft dryRun flag."), true));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.workflow_recommend"),
+						TEXT("Recommend MCP Workflow"),
+						TEXT("Given a goal, returns a step-by-step workflow composed of existing MCP tool calls."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpKnowledgeTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("evalPath"), MakeStringProperty(TEXT("Eval JSON file or directory inside the current project or the shared Tools/UnrealMcpKnowledge/Evals root."), FString()));
+				Properties->SetObjectField(TEXT("indexRoot"), MakeStringProperty(TEXT("Optional KnowledgeIndex root inside the current project's Saved directory. Use an isolated Saved root for repeatable evals."), FString()));
+				Properties->SetObjectField(TEXT("refreshIndex"), MakeBoolProperty(TEXT("Refresh the local KnowledgeCard index before running evals."), false));
+				Properties->SetObjectField(TEXT("includeDetails"), MakeBoolProperty(TEXT("Include per-case structuredContent in the eval output."), true));
+				Properties->SetObjectField(TEXT("limit"), MakeNumberProperty(TEXT("Search/recommendation limit used by each eval case."), 6.0));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.knowledge_eval_run"),
+					TEXT("Run Knowledge Evals"),
+					TEXT("Runs the offline RAG retrieval evaluation suite under Tools/UnrealMcpKnowledge/Evals/ and reports recall plus per-question diagnostics."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpKnowledgeTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: refreshIndex can replace a bounded project-Saved KnowledgeIndex before running local evals; evalPath is limited to project/shared eval roots.");
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("task"), MakeStringProperty(TEXT("Natural-language task to turn into a structured change plan."), FString()));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.preview_change_plan"),
+						TEXT("Preview Change Plan"),
+						TEXT("Converts a natural-language task into a structured plan with likely tools, risks, backups, and verification steps."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("snapshotName"), MakeStringProperty(TEXT("Optional snapshot name. Defaults to a UTC timestamp."), FString()));
+				Properties->SetObjectField(TEXT("assetPath"), MakeStringProperty(TEXT("Content path to scan for assets."), TEXT("/Game")));
+				Properties->SetObjectField(TEXT("includeActors"), MakeBoolProperty(TEXT("Include current level actors."), true));
+				Properties->SetObjectField(TEXT("includeAssets"), MakeBoolProperty(TEXT("Include assets under assetPath."), true));
+				Properties->SetObjectField(TEXT("includeBlueprints"), MakeBoolProperty(TEXT("Include Blueprint assets under assetPath."), true));
+				Properties->SetObjectField(TEXT("includeWidgets"), MakeBoolProperty(TEXT("Include Widget Blueprint assets under assetPath."), true));
+				Properties->SetObjectField(TEXT("includeMemory"), MakeBoolProperty(TEXT("Include project memory summaries."), true));
+				Properties->SetObjectField(TEXT("includeSkills"), MakeBoolProperty(TEXT("Include promoted project skills."), true));
+				Properties->SetObjectField(TEXT("actorLimit"), MakeNumberProperty(TEXT("Maximum actors to serialize."), 500.0));
+				Properties->SetObjectField(TEXT("assetLimit"), MakeNumberProperty(TEXT("Maximum assets per asset category to serialize."), 1000.0));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.capture_project_snapshot"),
+					TEXT("Capture Project Snapshot"),
+					TEXT("Captures a project state snapshot for later objective diffing of actors, assets, Blueprints, widgets, memory, and skills."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+					EUnrealMcpToolRisk::Low);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("beforeSnapshotPath"), MakeStringProperty(TEXT("Before snapshot path. If omitted, the previous latest snapshot is used."), FString()));
+				Properties->SetObjectField(TEXT("afterSnapshotPath"), MakeStringProperty(TEXT("After snapshot path. If omitted, the latest snapshot is used."), FString()));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.diff_project_snapshot"),
+						TEXT("Diff Project Snapshot"),
+						TEXT("Diffs two captured project snapshots and reports added/removed identities by area."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("task"), MakeStringProperty(TEXT("Original task goal to verify."), FString()));
+				Properties->SetObjectField(TEXT("beforeSnapshotPath"), MakeStringProperty(TEXT("Optional before snapshot path."), FString()));
+				Properties->SetObjectField(TEXT("afterSnapshotPath"), MakeStringProperty(TEXT("Optional after snapshot path."), FString()));
+				Properties->SetObjectField(TEXT("expectedChangedAreas"), MakeStringArrayProperty(TEXT("Areas expected to change: actors, assets, blueprints, widgets, memory, or skills.")));
+				Properties->SetObjectField(TEXT("expectedTools"), MakeStringArrayProperty(TEXT("Tool names expected to exist in tools/list.")));
+				Properties->SetObjectField(TEXT("evidenceText"), MakeStringProperty(TEXT("Optional tool output or summary text to inspect."), FString()));
+				Properties->SetObjectField(TEXT("requiredEvidenceText"), MakeStringProperty(TEXT("Optional substring that must appear in evidenceText."), FString()));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.verify_task_outcome"),
+						TEXT("Verify Task Outcome"),
+						TEXT("Checks task completion evidence using tools/list, snapshot diffs, and required text evidence."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("text"), MakeStringProperty(TEXT("Raw error text to classify."), FString()));
+				Properties->SetObjectField(TEXT("logPath"), MakeStringProperty(TEXT("Optional project-local log file to tail and classify."), FString()));
+				Properties->SetObjectField(TEXT("tailLines"), MakeNumberProperty(TEXT("Lines to read from logPath."), 200.0));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				Registrar.Add(
+					MakeDescriptor(
+						TEXT("unreal.mcp_classify_error"),
+						TEXT("Classify MCP Error"),
+						TEXT("Classifies UBT, MCP, JSON schema, UE Python, HTTP endpoint, OpenAI API, and editor-state errors with next-step suggestions."),
+						TEXT("self-extension"),
+						TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+						EUnrealMcpToolRisk::ReadOnly),
+					Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("contentPath"), MakeStringProperty(TEXT("Sandbox Content Browser path. Must be under /Game/__UEAtelier*."), TEXT("/Game/__UEvolveMcpTest")));
+				Properties->SetObjectField(TEXT("reset"), MakeBoolProperty(TEXT("Whether to delete and recreate the sandbox directory."), true));
+				Properties->SetObjectField(TEXT("resetActors"), MakeBoolProperty(TEXT("Whether to delete level actors whose labels start with actorLabelPrefix."), false));
+				Properties->SetObjectField(TEXT("actorLabelPrefix"), MakeStringProperty(TEXT("Safe actor label prefix for disposable actor tests. Must start with UEvolveMcpTest_ when resetActors=true."), TEXT("UEvolveMcpTest_")));
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview sandbox preparation without mutating assets."), false));
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.mcp_prepare_test_sandbox"),
+					TEXT("Prepare MCP Test Sandbox"),
+					TEXT("Creates or resets constrained /Game/__UEAtelier* asset and UEvolveMcpTest_* actor sandboxes for disposable happy-path tests."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpSelfExtensionPrecisionTools.cpp"),
+					EUnrealMcpToolRisk::Medium);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Registrar.Add(Descriptor, Schema);
+			}
+
+			{
+				TSharedPtr<FJsonObject> StepProperties = MakeShared<FJsonObject>();
+				StepProperties->SetObjectField(TEXT("name"), MakeStringProperty(TEXT("Human-readable step label."), FString()));
+				StepProperties->SetObjectField(TEXT("tool"), MakeStringProperty(TEXT("MCP tool name to call, for example unreal.editor_status."), FString()));
+				StepProperties->SetObjectField(TEXT("argumentsJson"), MakeStringProperty(TEXT("JSON object string used as the step tool arguments. Use {} for no arguments."), TEXT("{}")));
+				StepProperties->SetObjectField(TEXT("skip"), MakeBoolProperty(TEXT("Whether to skip this step."), false));
+				StepProperties->SetObjectField(TEXT("expectError"), MakeBoolProperty(TEXT("Whether the step is expected to return a tool error."), false));
+				StepProperties->SetObjectField(TEXT("continueOnError"), MakeBoolProperty(TEXT("Whether to continue the workflow if this step fails."), false));
+
+				TSharedPtr<FJsonObject> StepSchema = MakeObjectSchema();
+				StepSchema->SetObjectField(TEXT("properties"), StepProperties);
+
+				TSharedPtr<FJsonObject> StepsProperty = MakeShared<FJsonObject>();
+				StepsProperty->SetStringField(TEXT("type"), TEXT("array"));
+				StepsProperty->SetStringField(TEXT("description"), TEXT("Bounded list of workflow steps. Each step can call one registered MCP tool."));
+				StepsProperty->SetObjectField(TEXT("items"), StepSchema);
+
+				TSharedPtr<FJsonObject> Properties = MakeShared<FJsonObject>();
+				Properties->SetObjectField(TEXT("workflowName"), MakeStringProperty(TEXT("Human-readable workflow name."), TEXT("mcp_workflow")));
+				Properties->SetObjectField(TEXT("workflowJson"), MakeStringProperty(TEXT("Optional full workflow JSON object string. Useful when step arguments are complex."), FString()));
+				Properties->SetObjectField(TEXT("workflowPath"), MakeStringProperty(TEXT("Optional project-local workflow JSON file path. Ignored when workflowJson is provided."), FString()));
+				Properties->SetObjectField(TEXT("steps"), StepsProperty);
+				Properties->SetObjectField(TEXT("dryRun"), MakeBoolProperty(TEXT("Preview the workflow without executing step tools. Defaults to true for safety."), true));
+				Properties->SetObjectField(TEXT("stopOnFailure"), MakeBoolProperty(TEXT("Stop at the first failed step unless the step has continueOnError=true."), true));
+				Properties->SetObjectField(TEXT("maxSteps"), MakeNumberProperty(TEXT("Maximum number of steps allowed in this run, clamped to 1-100."), 20.0));
+				Properties->SetObjectField(TEXT("writeMemory"), MakeBoolProperty(TEXT("Write workflow status to project memory for long-task continuation."), true));
+				Properties->SetObjectField(TEXT("memoryKey"), MakeStringProperty(TEXT("Project memory key used when writeMemory=true."), TEXT("chat.active_task")));
+				Properties->SetObjectField(TEXT("allowHighRisk"), MakeBoolProperty(TEXT("Allow high-risk step tools to execute when dryRun=false."), false));
+				Properties->SetObjectField(TEXT("allowCritical"), MakeBoolProperty(TEXT("Allow critical-risk step tools to execute when dryRun=false."), false));
+				Properties->SetObjectField(TEXT("includeStepStructuredContent"), MakeBoolProperty(TEXT("Include each step structuredContent in the workflow result. Off by default to keep context compact."), false));
+				Properties->SetObjectField(TEXT("maxResultChars"), MakeNumberProperty(TEXT("Maximum text preview characters retained per executed step."), 1200.0));
+
+				TSharedPtr<FJsonObject> Schema = MakeObjectSchema();
+				Schema->SetObjectField(TEXT("properties"), Properties);
+
+				FUnrealMcpToolDescriptor Descriptor = MakeDescriptor(
+					TEXT("unreal.workflow_run"),
+					TEXT("Run MCP Workflow"),
+					TEXT("Runs a bounded, policy-checked sequence of MCP tool calls with dry-run planning, risk gates, failure pause, and project-memory handoff."),
+					TEXT("self-extension"),
+					TEXT("UnrealMcpWorkflowTools.cpp"),
+					EUnrealMcpToolRisk::High);
+				Descriptor.bRequiresWrite = true;
+				Descriptor.bRequiresProjectMemory = true;
+				Descriptor.bDryRunSupport = true;
+				Descriptor.bPreflightSupport = true;
+				Descriptor.bPostcheckSupport = true;
+				Descriptor.TestCoverage = EUnrealMcpToolTestCoverage::Category;
+				Descriptor.Reason = TEXT("Descriptor: generic high-level composition executor for safe MCP tool orchestration.");
+				Registrar.Add(Descriptor, Schema);
+			}
+		}
+
+		void RegisterAllMcpToolDescriptors(FUnrealMcpToolRegistrar& Registrar)
+		{
+			RegisterEditorMcpToolDescriptors(Registrar);
+			RegisterActorMcpToolDescriptors(Registrar);
+			RegisterBlueprintInspectorMcpToolDescriptors(Registrar);
+			RegisterCodeMcpToolDescriptors(Registrar);
+			RegisterWidgetInspectorMcpToolDescriptors(Registrar);
+			RegisterWidgetEditMcpToolDescriptors(Registrar);
+			RegisterMaterialInstanceMcpToolDescriptors(Registrar);
+			RegisterScaffoldMcpToolDescriptors(Registrar);
+			RegisterSkillSessionMcpToolDescriptors(Registrar);
+			RegisterTaskAtlasMcpToolDescriptors(Registrar);
+			RegisterVerificationMcpToolDescriptors(Registrar);
+			RegisterSelfExtensionMcpToolDescriptors(Registrar);
+		}
+	}
+
+	void FUnrealMcpToolRegistrar::Add(const FUnrealMcpToolDescriptor& Descriptor, const TSharedPtr<FJsonObject>& InputSchema)
+	{
+		FRegisteredUnrealMcpToolDescriptor RegisteredTool;
+		RegisteredTool.Descriptor = Descriptor;
+		RegisteredTool.InputSchema = InputSchema.IsValid() ? InputSchema : MakeObjectSchema();
+		Tools.Add(MoveTemp(RegisteredTool));
+	}
+
+	const TArray<FRegisteredUnrealMcpToolDescriptor>& FUnrealMcpToolRegistrar::GetTools() const
+	{
+		return Tools;
+	}
+
+	const TArray<FRegisteredUnrealMcpToolDescriptor>& GetRegisteredMcpToolDescriptors()
+	{
+		static const TArray<FRegisteredUnrealMcpToolDescriptor> RegisteredTools = []()
+		{
+			FUnrealMcpToolRegistrar Registrar;
+			RegisterAllMcpToolDescriptors(Registrar);
+			return Registrar.GetTools();
+		}();
+		return RegisteredTools;
+	}
+
+	const FRegisteredUnrealMcpToolDescriptor* FindRegisteredMcpToolDescriptor(const FString& ToolName)
+	{
+		for (const FRegisteredUnrealMcpToolDescriptor& RegisteredTool : GetRegisteredMcpToolDescriptors())
+		{
+			if (RegisteredTool.Descriptor.Name.Equals(ToolName, ESearchCase::CaseSensitive))
+			{
+				return &RegisteredTool;
+			}
+		}
+		return nullptr;
+	}
+
+	void AppendRegisteredToolDefinitions(TArray<TSharedPtr<FJsonValue>>& ToolsArray)
+	{
+		TSet<FString> AddedToolNames;
+		for (const TSharedPtr<FJsonValue>& ExistingToolValue : ToolsArray)
+		{
+			if (!ExistingToolValue.IsValid() || ExistingToolValue->Type != EJson::Object || !ExistingToolValue->AsObject().IsValid())
+			{
+				continue;
+			}
+			FString ExistingName;
+			if (ExistingToolValue->AsObject()->TryGetStringField(TEXT("name"), ExistingName) && !ExistingName.IsEmpty())
+			{
+				AddedToolNames.Add(ExistingName);
+			}
+		}
+
+		for (const FRegisteredUnrealMcpToolDescriptor& RegisteredTool : GetRegisteredMcpToolDescriptors())
+		{
+			if (AddedToolNames.Contains(RegisteredTool.Descriptor.Name))
+			{
+				continue;
+			}
+
+			const int32 PreviousToolCount = ToolsArray.Num();
+			AddToolDefinition(
+				ToolsArray,
+				RegisteredTool.Descriptor.Name,
+				RegisteredTool.Descriptor.Title,
+				RegisteredTool.Descriptor.Description,
+				RegisteredTool.InputSchema);
+			if (ToolsArray.Num() > PreviousToolCount)
+			{
+				AddedToolNames.Add(RegisteredTool.Descriptor.Name);
+			}
+		}
+
+		for (const FToolRegistryEntry& Entry : GetToolRegistryEntries())
+		{
+			if (Entry.ImplementationTrack != EToolImplementationTrack::Python
+				|| Entry.Exposure != EToolExposure::Visible
+				|| Entry.bLoadedFromDescriptor
+				|| AddedToolNames.Contains(Entry.Name))
+			{
+				continue;
+			}
+
+			const FString ToolTitle = Entry.Title.IsEmpty() ? Entry.Name : Entry.Title;
+			const FString ToolDescription = Entry.Description.IsEmpty() ? Entry.Notes : Entry.Description;
+			const TSharedPtr<FJsonObject> InputSchema = Entry.InputSchema.IsValid() ? Entry.InputSchema : MakeObjectSchema();
+			const int32 PreviousToolCount = ToolsArray.Num();
+			AddToolDefinition(
+				ToolsArray,
+				Entry.Name,
+				ToolTitle,
+				ToolDescription,
+				InputSchema);
+			if (ToolsArray.Num() > PreviousToolCount)
+			{
+				AddedToolNames.Add(Entry.Name);
+			}
+		}
+
+		{
+			UserToolLock::FSharedGuard UserRegistryGuard;
+			for (const UserRegistry::FUserToolEntry* UserTool : UserRegistry::GetAllUserTools())
+			{
+				if (!UserTool || AddedToolNames.Contains(UserTool->ToolName))
+				{
+					continue;
+				}
+
+				FString ToolTitle = UserTool->ToolName;
+				FString ToolDescription = TEXT("Project-local user Python MCP tool.");
+				TSharedPtr<FJsonObject> InputSchema = MakeObjectSchema();
+				if (UserTool->ToolJson.IsValid())
+				{
+					UserTool->ToolJson->TryGetStringField(TEXT("title"), ToolTitle);
+					UserTool->ToolJson->TryGetStringField(TEXT("description"), ToolDescription);
+					const TSharedPtr<FJsonObject>* InputSchemaObject = nullptr;
+					if (UserTool->ToolJson->TryGetObjectField(TEXT("inputSchema"), InputSchemaObject) && InputSchemaObject && (*InputSchemaObject).IsValid())
+					{
+						InputSchema = *InputSchemaObject;
+					}
+				}
+
+				const int32 PreviousToolCount = ToolsArray.Num();
+				AddToolDefinition(
+					ToolsArray,
+					UserTool->ToolName,
+					ToolTitle.IsEmpty() ? UserTool->ToolName : ToolTitle,
+					ToolDescription,
+					InputSchema);
+				if (ToolsArray.Num() > PreviousToolCount)
+				{
+					AddedToolNames.Add(UserTool->ToolName);
+				}
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> MakeToolDescriptorStatusObject()
+	{
+		TArray<TSharedPtr<FJsonValue>> ToolValues;
+		TMap<FString, int32> CategoryCounts;
+		for (const FRegisteredUnrealMcpToolDescriptor& RegisteredTool : GetRegisteredMcpToolDescriptors())
+		{
+			const FUnrealMcpToolDescriptor& Descriptor = RegisteredTool.Descriptor;
+			TSharedPtr<FJsonObject> DescriptorObject = MakeShared<FJsonObject>();
+			DescriptorObject->SetStringField(TEXT("name"), Descriptor.Name);
+			DescriptorObject->SetStringField(TEXT("title"), Descriptor.Title);
+			DescriptorObject->SetStringField(TEXT("category"), Descriptor.Category);
+			DescriptorObject->SetStringField(TEXT("handlerName"), Descriptor.HandlerName.IsEmpty() ? Descriptor.Name : Descriptor.HandlerName);
+			DescriptorObject->SetStringField(TEXT("sourceFile"), Descriptor.SourceFile);
+			DescriptorObject->SetStringField(TEXT("exposure"), LexToString(Descriptor.Exposure));
+			DescriptorObject->SetStringField(TEXT("riskLevel"), LexToString(Descriptor.RiskLevel));
+			DescriptorObject->SetStringField(TEXT("testCoverage"), LexToString(Descriptor.TestCoverage));
+			DescriptorObject->SetStringField(TEXT("docsPath"), Descriptor.DocsPath);
+			ToolValues.Add(MakeShared<FJsonValueObject>(DescriptorObject));
+			CategoryCounts.FindOrAdd(Descriptor.Category)++;
+		}
+
+		TSharedPtr<FJsonObject> CategoryCountsObject = MakeShared<FJsonObject>();
+		for (const TPair<FString, int32>& Pair : CategoryCounts)
+		{
+			CategoryCountsObject->SetNumberField(Pair.Key, Pair.Value);
+		}
+
+		TSharedPtr<FJsonObject> StatusObject = MakeShared<FJsonObject>();
+		StatusObject->SetNumberField(TEXT("descriptorCount"), GetRegisteredMcpToolDescriptors().Num());
+		StatusObject->SetObjectField(TEXT("categoryCounts"), CategoryCountsObject);
+		StatusObject->SetArrayField(TEXT("tools"), ToolValues);
+		return StatusObject;
+	}
+
+	FString LexToString(EUnrealMcpToolExposure Exposure)
+	{
+		return Exposure == EUnrealMcpToolExposure::LegacyHidden ? TEXT("legacy_hidden") : TEXT("visible");
+	}
+
+	FString LexToString(EUnrealMcpToolRisk Risk)
+	{
+		switch (Risk)
+		{
+		case EUnrealMcpToolRisk::ReadOnly:
+			return TEXT("read_only");
+		case EUnrealMcpToolRisk::Medium:
+			return TEXT("medium");
+		case EUnrealMcpToolRisk::High:
+			return TEXT("high");
+		case EUnrealMcpToolRisk::Critical:
+			return TEXT("critical");
+		case EUnrealMcpToolRisk::Low:
+		default:
+			return TEXT("low");
+		}
+	}
+
+	FString LexToString(EUnrealMcpToolTestCoverage TestCoverage)
+	{
+		switch (TestCoverage)
+		{
+		case EUnrealMcpToolTestCoverage::Core:
+			return TEXT("core");
+		case EUnrealMcpToolTestCoverage::Category:
+			return TEXT("category");
+		case EUnrealMcpToolTestCoverage::Manual:
+			return TEXT("manual");
+		case EUnrealMcpToolTestCoverage::External:
+			return TEXT("external");
+		case EUnrealMcpToolTestCoverage::Missing:
+		default:
+			return TEXT("missing");
+		}
+	}
+}

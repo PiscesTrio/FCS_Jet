@@ -1,0 +1,212 @@
+#pragma once
+
+#include "CoreMinimal.h"
+#include "Widgets/Input/SComboBox.h"
+#include "Widgets/SCompoundWidget.h"
+
+class FUnrealMcpModule;
+class FJsonObject;
+class IHttpRequest;
+class IUnrealMcpAssistantHandle;
+class SApprovalCard;
+class SComboButton;
+class SEditableTextBox;
+class SScrollBox;
+class STextBlock;
+class SVerticalBox;
+enum class EAiProviderKind : uint8;
+struct FUnrealMcpExecutionResult;
+
+enum class EUnrealMcpChatEntryType : uint8
+{
+	User,
+	Assistant,
+	System,
+	Tool
+};
+
+struct FUnrealMcpChatEntry
+{
+	EUnrealMcpChatEntryType Type = EUnrealMcpChatEntryType::System;
+	FString Speaker;
+	FString Title;
+	FString Body;
+	FString Details;
+	FString ToolCallId;
+	bool bIsError = false;
+	bool bIsPending = false;
+	bool bToolCardExpanded = false;
+	bool bToolRequiresWrite = false;
+	FString ToolRiskLevel;
+	FString ToolCategory;
+	FString ToolDescription;
+	FString ToolSummary;
+	FString WorkflowStepSummary;
+	bool bCanRateTask = false;
+	FString TaskAtlasTaskId;
+	FString TaskAtlasRating;
+};
+
+struct FUnrealMcpSkillOption
+{
+	FString Name;
+	FString Title;
+	FString Description;
+	FString Path;
+};
+
+struct FUnrealMcpExportableToolOption
+{
+	FString ToolName;
+	FString ScaffoldDir;
+	FString SourceKind;
+	bool bHasDescriptor = false;
+	bool bHasTests = false;
+};
+
+class SUnrealMcpChatPanel final : public SCompoundWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SUnrealMcpChatPanel) {}
+	SLATE_END_ARGS()
+
+	~SUnrealMcpChatPanel();
+
+	void Construct(const FArguments& InArgs, FUnrealMcpModule* InOwnerModule);
+	bool InjectUserMessage(const FString& Text);
+
+private:
+	FReply HandleSendClicked();
+	FReply HandleStopClicked();
+	FReply HandleClearClicked();
+	FReply HandleCopyChatClicked();
+	FReply HandleCopyToolLogClicked();
+	FReply HandleToolsOverviewClicked();
+	FReply HandleTaskAtlasClicked();
+	FReply HandleOpenAiSettingsClicked();
+	FReply HandleTestAiConnectionClicked();
+	FReply HandleRefreshSkillsClicked();
+	FReply HandleReadSelectedSkillClicked();
+	FReply HandleApplySelectedSkillClicked();
+	FReply HandleExportToolPackageClicked();
+	FReply HandleImportToolPackageClicked();
+	FReply HandleReadMemoryClicked();
+	FReply HandleWriteCurrentTaskMemoryClicked();
+	void HandleInputCommitted(const FText& InText, ETextCommit::Type CommitType);
+	void HandlePresetClicked(FString CommandText);
+	void HandleProviderSelectionChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo); void HandleModelSelectionChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo); void HandleModelTextCommitted(const FText& InText, ETextCommit::Type CommitType);
+	void HandleSkillSelectionChanged(TSharedPtr<FUnrealMcpSkillOption> NewSelection, ESelectInfo::Type SelectInfo);
+	void HandleSkillApplyModeChanged(TSharedPtr<FString> NewSelection, ESelectInfo::Type SelectInfo);
+	void RefreshProviderOptions(); void RefreshModelOptionsForActiveProvider(); void LoadRecentModelsFromDisk(); void SaveRecentModelsToDisk() const;
+	void SetActiveProviderById(const FString& NewId); void RememberRecentModel(const FString& ProviderId, const FString& Model);
+	FText GetCurrentProviderDisplayText() const; FText GetCurrentModelDisplayText() const; bool IsActiveProviderModelLocked() const; static FString KindShortName(EAiProviderKind Kind);
+	void SendCurrentInput();
+	void SendCommand(const FString& CommandText);
+	void StopAssistantRequest();
+	void StartAssistantRequest(const FString& UserPrompt);
+	void StartAiConnectionTest();
+	void RefreshToolsOverviewIfRegistryChanged();
+	void RefreshSkillOptions(bool bAppendResult);
+	TSharedRef<SWidget> MakeSkillComboOption(TSharedPtr<FUnrealMcpSkillOption> SkillOption) const;
+	TSharedRef<SWidget> MakeSkillApplyModeComboOption(TSharedPtr<FString> ApplyMode) const;
+	TSharedRef<SWidget> MakeExportableToolComboOption(TSharedPtr<FUnrealMcpExportableToolOption> ToolOption) const;
+	TSharedRef<SWidget> MakeRecentModelsMenu();
+	FText GetSelectedSkillText() const;
+	FText GetSelectedSkillDescriptionText() const;
+	FText GetSelectedSkillApplyModeText() const;
+	FString GetSelectedSkillName() const;
+	FString GetSelectedSkillApplyMode() const;
+	FString GetSkillTaskOrFallback() const;
+	FString BuildSkillAskPrompt(const FString& SkillName, const FString& Task) const;
+	bool ShowExportToolPackageDialog(const TArray<TSharedPtr<FUnrealMcpExportableToolOption>>& ExportableTools, FString& OutToolName, bool& bOutDryRun);
+	bool ShowImportToolPackageDialog(FString& OutPackagePath, bool& bOutDryRun);
+	FString BuildToolPackageSummary(const FString& ToolName, const FUnrealMcpExecutionResult& Result) const;
+	void AppendToolExecutionResult(const FString& ToolName, const FJsonObject& Arguments, const FUnrealMcpExecutionResult& Result);
+	void UpdateToolEntryWithResult(
+		const TSharedPtr<FUnrealMcpChatEntry>& Entry,
+		const FString& ArgumentsJson,
+		const FUnrealMcpExecutionResult& Result);
+	TSharedPtr<FUnrealMcpChatEntry> AppendMessage(EUnrealMcpChatEntryType Type, const FString& Speaker, const FString& Message, bool bIsError = false);
+	TSharedPtr<FUnrealMcpChatEntry> AppendToolCard(const FString& ToolName, const FString& ToolCallId, const FString& ArgumentsJson);
+	void AppendApprovalCard(const FString& ApprovalId, const FString& ToolName, const FString& RiskLevel, const FString& Reason, const FString& ArgumentsJson);
+	void OnApprovalDecided(const FString& ApprovalId, bool bApproved);
+	void ReaddPendingApprovalCards();
+	void AddEntryWidget(const TSharedPtr<FUnrealMcpChatEntry>& Entry);
+	void AddEntryWidgetToPane(const TSharedPtr<FUnrealMcpChatEntry>& Entry, bool bScrollAfterAdd);
+	TSharedRef<SWidget> BuildEntryWidget(const TSharedPtr<FUnrealMcpChatEntry>& Entry);
+	void RebuildEntryWidgets(bool bScrollTranscript, bool bScrollToolLog);
+	void InvalidateEntryWidgets();
+	bool MoveEntryToEnd(const TSharedPtr<FUnrealMcpChatEntry>& Entry);
+	void ScrollTranscriptToEnd();
+	void ScrollToolLogToEnd();
+	EActiveTimerReturnType HandleDeferredTranscriptScroll(double InCurrentTime, float InDeltaTime);
+	EActiveTimerReturnType HandleDeferredToolLogScroll(double InCurrentTime, float InDeltaTime);
+	FText GetActiveRequestProgressText() const;
+	FString BuildEntryCopyText(const FUnrealMcpChatEntry& Entry) const;
+	bool IsTranscriptNearBottom() const;
+	FReply HandleEntryCopyClicked(TSharedPtr<FUnrealMcpChatEntry> Entry);
+	FReply HandleRateTaskClicked(TSharedPtr<FUnrealMcpChatEntry> Entry, FString Rating);
+	void AnnotateTaskAtlasEvent(const FString& Kind, const FString& Content);
+	FString ResolveLatestTaskAtlasTaskId() const;
+	bool ShouldOfferTaskRating(const FString& AssistantText, bool bIsError, bool bWasCancelled) const;
+	void LoadHistory();
+	void SaveHistory() const;
+	void ResetHistory(bool bAddReadyMessage);
+	FString BuildTranscriptText() const;
+	FString BuildToolLogText() const;
+	bool HasTranscriptEntries() const;
+	bool HasToolLogEntries() const;
+	FString BuildRagContextBlock(const FString& CurrentUserPrompt) const;
+	FString BuildAssistantConversationContext(const FString& CurrentUserPrompt) const;
+	FString BuildToolsOverviewText(const FUnrealMcpExecutionResult& Result) const;
+
+	FUnrealMcpModule* OwnerModule = nullptr;
+	uint64 LastObservedUserToolListVersion = 0;
+	FString CachedToolsOverviewText;
+	bool bToolsOverviewCacheValid = false;
+	FString LastAssistantResponseId;
+	FString LastLogText;
+	mutable FString LastRagContextPrompt;
+	mutable FString LastRagContextBlock;
+	mutable bool bRagAutoRefreshFailedThisSession = false;
+	bool bAssistantRequestInFlight = false;
+	FDateTime ActiveAssistantRequestStartTime;
+	bool bHasInjectedPersistedContextThisSession = false;
+	TArray<TSharedPtr<FUnrealMcpChatEntry>> Entries;
+	TMap<FString, TSharedPtr<FUnrealMcpChatEntry>> ToolEntriesByCallId;
+	TArray<TSharedPtr<FUnrealMcpSkillOption>> SkillOptions;
+	TSharedPtr<FUnrealMcpSkillOption> SelectedSkill;
+	TArray<TSharedPtr<FString>> SkillApplyModes;
+	TSharedPtr<FString> SelectedSkillApplyMode;
+	TArray<TSharedPtr<FString>> ProviderOptionIds; TSharedPtr<FString> SelectedProviderId;
+	TArray<TSharedPtr<FString>> ModelOptions; TSharedPtr<FString> SelectedModel;
+	TMap<FString, TArray<FString>> RecentModelsByProvider;
+	TSharedPtr<FUnrealMcpChatEntry> ActiveAssistantEntry;
+	TSharedPtr<IUnrealMcpAssistantHandle, ESPMode::ThreadSafe> ActiveAssistantHandle;
+	TMap<FString, TSharedPtr<SApprovalCard>> PendingApprovalCards;
+	TSharedPtr<IHttpRequest, ESPMode::ThreadSafe> ActiveAiTestRequest;
+	TSharedPtr<SEditableTextBox> InputTextBox;
+	TSharedPtr<SEditableTextBox> SkillTaskTextBox;
+	TSharedPtr<SEditableTextBox> ModelEditableTextBox; TSharedPtr<SComboBox<TSharedPtr<FString>>> ProviderComboBox; TSharedPtr<SComboButton> ModelComboButton;
+	TSharedPtr<SComboBox<TSharedPtr<FUnrealMcpSkillOption>>> SkillComboBox;
+	TSharedPtr<SComboBox<TSharedPtr<FString>>> SkillApplyModeComboBox;
+	TSharedPtr<STextBlock> SkillDescriptionText;
+	TSharedPtr<SScrollBox> TranscriptScrollBox;
+	TSharedPtr<SVerticalBox> TranscriptEntriesBox;
+	TSharedPtr<SScrollBox> ToolLogScrollBox;
+	TSharedPtr<SVerticalBox> ToolLogEntriesBox;
+	bool bDeferredTranscriptScrollActive = false;
+	bool bDeferredTranscriptShouldAutoScroll = true;
+	int32 DeferredTranscriptScrollFrames = 0;
+	bool bDeferredToolLogScrollActive = false;
+	bool bDeferredToolLogShouldAutoScroll = true;
+	int32 DeferredToolLogScrollFrames = 0;
+	FString LastExportCopyDir;
+};
+
+namespace UnrealMcp::ChatPanelRegistry
+{
+	void RegisterActivePanel(SUnrealMcpChatPanel* Panel);
+	void UnregisterActivePanel(SUnrealMcpChatPanel* Panel);
+	SUnrealMcpChatPanel* TryGetActivePanel();
+}

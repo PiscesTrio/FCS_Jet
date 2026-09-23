@@ -1,0 +1,3713 @@
+#include "UnrealMcpBlueprintTools.h"
+
+#include "UnrealMcpBlueprintComponentLibrary.h"
+#include "UnrealMcpBlueprintGraphLibrary.h"
+#include "UnrealMcpModule.h"
+
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
+#include "Editor.h"
+#include "EditorScriptingHelpers.h"
+#include "Engine/Blueprint.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
+#include "EdGraphSchema_K2.h"
+#include "EdGraphSchema_K2_Actions.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_Event.h"
+#include "K2Node_IfThenElse.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_Variable.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "KismetCompilerModule.h"
+#include "Misc/PackageName.h"
+#include "ScopedTransaction.h"
+#include "Subsystems/AssetEditorSubsystem.h"
+#include "Subsystems/EditorAssetSubsystem.h"
+#include "UObject/Interface.h"
+#include "UObject/Package.h"
+#include "UObject/UnrealType.h"
+
+#define LOCTEXT_NAMESPACE "UnrealMcpBlueprintTools"
+
+namespace UnrealMcp
+{
+	int32 GetPositiveIntArgument(const FJsonObject& Arguments, const FString& FieldName, int32 DefaultValue);
+	bool IsEditorPlaying();
+	FUnrealMcpExecutionResult MakePieBlockedResult(const FString& ToolName);
+	FUnrealMcpExecutionResult MakeExecutionResult(const FString& Text, const TSharedPtr<FJsonObject>& StructuredContent, bool bIsError);
+	UObject* LoadAssetFromAnyPath(UEditorAssetSubsystem* EditorAssetSubsystem, const FString& AnyAssetPath, FString& OutObjectPath, FString& OutFailureReason);
+	UClass* ResolveClassPath(const FString& ClassPath, UEditorAssetSubsystem* EditorAssetSubsystem);
+	UBlueprint* LoadBlueprintAsset(UEditorAssetSubsystem* EditorAssetSubsystem, const FString& BlueprintPath, FString& OutObjectPath, FString& OutFailureReason);
+	TSharedPtr<FJsonObject> MakeBlueprintEditStructuredContent(UBlueprint* Blueprint, UEdGraph* Graph, UEdGraphNode* Node, const FString& Action);
+	TSharedPtr<FJsonObject> DescribeBlueprintNode(const UEdGraphNode* Node);
+	TSharedPtr<FJsonObject> DescribeBlueprintPin(const UEdGraphPin* Pin);
+	UEdGraph* ResolveBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName, bool bCreateEventGraphIfMissing, FString& OutFailureReason);
+	UEdGraphNode* FindBlueprintNodeByGuid(UEdGraph* Graph, const FString& NodeGuidString);
+	UEdGraphPin* FindBlueprintPinByName(UEdGraphNode* Node, const FString& PinName);
+	bool BuildBlueprintPinType(const FJsonObject& Arguments, UEditorAssetSubsystem* EditorAssetSubsystem, FEdGraphPinType& OutPinType, FString& OutFailureReason);
+	UFunction* ResolveFunctionByClassAndName(UEditorAssetSubsystem* EditorAssetSubsystem, const FString& FunctionClassPath, const FString& FunctionName, FString& OutFailureReason);
+	UEdGraph* FindStandardMacroGraph(const FString& MacroName);
+
+	void GatherBlueprintGraphs(UBlueprint* Blueprint, TArray<UEdGraph*>& OutGraphs)
+	{
+		if (!Blueprint)
+		{
+			return;
+		}
+
+		for (UEdGraph* Graph : Blueprint->UbergraphPages)
+		{
+			if (Graph)
+			{
+				OutGraphs.AddUnique(Graph);
+			}
+		}
+		for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+		{
+			if (Graph)
+			{
+				OutGraphs.AddUnique(Graph);
+			}
+		}
+		for (UEdGraph* Graph : Blueprint->MacroGraphs)
+		{
+			if (Graph)
+			{
+				OutGraphs.AddUnique(Graph);
+			}
+		}
+	}
+
+	TSharedPtr<FJsonObject> DescribeBlueprintGraph(UEdGraph* Graph, bool bIncludePins)
+	{
+		TSharedPtr<FJsonObject> GraphObject = MakeShared<FJsonObject>();
+		if (!Graph)
+		{
+			return GraphObject;
+		}
+
+		GraphObject->SetStringField(TEXT("name"), Graph->GetName());
+		GraphObject->SetStringField(TEXT("schema"), Graph->Schema ? Graph->Schema->GetPathName() : FString());
+		TArray<TSharedPtr<FJsonValue>> NodeValues;
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (!Node)
+			{
+				continue;
+			}
+			TSharedPtr<FJsonObject> NodeObject = DescribeBlueprintNode(Node);
+			if (!bIncludePins)
+			{
+				NodeObject->SetArrayField(TEXT("pins"), TArray<TSharedPtr<FJsonValue>>());
+			}
+			NodeValues.Add(MakeShared<FJsonValueObject>(NodeObject));
+		}
+		GraphObject->SetNumberField(TEXT("nodeCount"), NodeValues.Num());
+		GraphObject->SetArrayField(TEXT("nodes"), NodeValues);
+		return GraphObject;
+	}
+
+	FString NormalizeBlueprintAssetPath(const FString& InputPath)
+	{
+		FString Path = InputPath.TrimStartAndEnd();
+		Path.ReplaceInline(TEXT("\\"), TEXT("/"));
+		if (Path.IsEmpty() || Path.Contains(TEXT(".")) || !Path.StartsWith(TEXT("/"), ESearchCase::CaseSensitive))
+		{
+			return Path;
+		}
+
+		int32 LastSlashIndex = INDEX_NONE;
+		Path.FindLastChar(TEXT('/'), LastSlashIndex);
+		if (LastSlashIndex == INDEX_NONE || LastSlashIndex >= Path.Len() - 1)
+		{
+			return Path;
+		}
+
+		const FString LastSegment = Path.Mid(LastSlashIndex + 1);
+		if (LastSegment.IsEmpty() || LastSegment.Contains(TEXT(".")))
+		{
+			return Path;
+		}
+
+		return FString::Printf(TEXT("%s.%s"), *Path, *LastSegment);
+	}
+
+	UObject* LoadAssetFromAnyPath(
+		UEditorAssetSubsystem* EditorAssetSubsystem,
+		const FString& AnyAssetPath,
+		FString& OutObjectPath,
+		FString& OutFailureReason)
+	{
+		if (!EditorAssetSubsystem)
+		{
+			OutFailureReason = TEXT("EditorAssetSubsystem is unavailable.");
+			return nullptr;
+		}
+
+		const FString NormalizedCandidate = NormalizeBlueprintAssetPath(AnyAssetPath);
+		if (!NormalizedCandidate.Equals(AnyAssetPath, ESearchCase::CaseSensitive))
+		{
+			FString CandidateFailureReason;
+			FString CandidateObjectPath = EditorScriptingHelpers::ConvertAnyPathToObjectPath(NormalizedCandidate, CandidateFailureReason);
+			if (!CandidateObjectPath.IsEmpty())
+			{
+				if (UObject* LoadedAsset = EditorAssetSubsystem->LoadAsset(CandidateObjectPath))
+				{
+					OutObjectPath = CandidateObjectPath;
+					OutFailureReason.Reset();
+					return LoadedAsset;
+				}
+			}
+		}
+
+		OutObjectPath = EditorScriptingHelpers::ConvertAnyPathToObjectPath(AnyAssetPath, OutFailureReason);
+		if (OutObjectPath.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		UObject* LoadedAsset = EditorAssetSubsystem->LoadAsset(OutObjectPath);
+		if (!LoadedAsset)
+		{
+			OutFailureReason = FString::Printf(TEXT("Failed to load asset '%s'."), *OutObjectPath);
+		}
+
+		return LoadedAsset;
+	}
+
+	UClass* ResolveClassPath(const FString& ClassPath, UEditorAssetSubsystem* EditorAssetSubsystem)
+	{
+		const FString TrimmedPath = ClassPath.TrimStartAndEnd();
+		if (TrimmedPath.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		if (UClass* NativeClass = StaticLoadClass(UObject::StaticClass(), nullptr, *TrimmedPath))
+		{
+			return NativeClass;
+		}
+
+		if (!EditorAssetSubsystem)
+		{
+			return nullptr;
+		}
+
+		if (UClass* BlueprintClass = EditorAssetSubsystem->LoadBlueprintClass(TrimmedPath))
+		{
+			return BlueprintClass;
+		}
+
+		if (UObject* LoadedAsset = EditorAssetSubsystem->LoadAsset(TrimmedPath))
+		{
+			if (UClass* LoadedClass = Cast<UClass>(LoadedAsset))
+			{
+				return LoadedClass;
+			}
+
+			if (UBlueprint* Blueprint = Cast<UBlueprint>(LoadedAsset))
+			{
+				return Blueprint->GeneratedClass;
+			}
+		}
+
+		return nullptr;
+	}
+
+	FString PinDirectionToString(EEdGraphPinDirection Direction)
+	{
+		return Direction == EGPD_Input ? TEXT("input") : TEXT("output");
+	}
+
+	TSharedPtr<FJsonObject> DescribeBlueprintPin(const UEdGraphPin* Pin)
+	{
+		TSharedPtr<FJsonObject> PinObject = MakeShared<FJsonObject>();
+		if (!Pin)
+		{
+			return PinObject;
+		}
+
+		PinObject->SetStringField(TEXT("name"), Pin->PinName.ToString());
+		PinObject->SetStringField(TEXT("displayName"), Pin->GetDisplayName().ToString());
+		PinObject->SetStringField(TEXT("direction"), PinDirectionToString(Pin->Direction));
+		PinObject->SetStringField(TEXT("category"), Pin->PinType.PinCategory.ToString());
+		PinObject->SetStringField(TEXT("subCategory"), Pin->PinType.PinSubCategory.ToString());
+		if (Pin->PinType.PinSubCategoryObject.IsValid())
+		{
+			PinObject->SetStringField(TEXT("subCategoryObject"), Pin->PinType.PinSubCategoryObject.Get()->GetPathName());
+		}
+		PinObject->SetBoolField(TEXT("isArray"), Pin->PinType.IsArray());
+		PinObject->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
+		PinObject->SetStringField(TEXT("defaultObject"), Pin->DefaultObject ? Pin->DefaultObject->GetPathName() : FString());
+
+		TArray<TSharedPtr<FJsonValue>> LinkedPinsArray;
+		for (const UEdGraphPin* LinkedPin : Pin->LinkedTo)
+		{
+			if (!LinkedPin || !LinkedPin->GetOwningNode())
+			{
+				continue;
+			}
+
+			TSharedPtr<FJsonObject> LinkObject = MakeShared<FJsonObject>();
+			LinkObject->SetStringField(TEXT("nodeGuid"), LinkedPin->GetOwningNode()->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+			LinkObject->SetStringField(TEXT("pin"), LinkedPin->PinName.ToString());
+			LinkedPinsArray.Add(MakeShared<FJsonValueObject>(LinkObject));
+		}
+		PinObject->SetArrayField(TEXT("linkedTo"), LinkedPinsArray);
+
+		return PinObject;
+	}
+
+	TSharedPtr<FJsonObject> DescribeBlueprintNode(const UEdGraphNode* Node)
+	{
+		TSharedPtr<FJsonObject> NodeObject = MakeShared<FJsonObject>();
+		if (!Node)
+		{
+			return NodeObject;
+		}
+
+		NodeObject->SetStringField(TEXT("nodeGuid"), Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		NodeObject->SetStringField(TEXT("nodeClass"), Node->GetClass()->GetPathName());
+		NodeObject->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+		NodeObject->SetStringField(TEXT("graph"), Node->GetGraph() ? Node->GetGraph()->GetName() : FString());
+		NodeObject->SetNumberField(TEXT("x"), Node->NodePosX);
+		NodeObject->SetNumberField(TEXT("y"), Node->NodePosY);
+
+		TArray<TSharedPtr<FJsonValue>> PinsArray;
+		for (const UEdGraphPin* Pin : Node->Pins)
+		{
+			PinsArray.Add(MakeShared<FJsonValueObject>(DescribeBlueprintPin(Pin)));
+		}
+		NodeObject->SetArrayField(TEXT("pins"), PinsArray);
+
+		return NodeObject;
+	}
+
+	TSharedPtr<FJsonObject> MakeBlueprintEditStructuredContent(
+		UBlueprint* Blueprint,
+		UEdGraph* Graph,
+		UEdGraphNode* Node,
+		const FString& Action)
+	{
+		TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+		StructuredContent->SetStringField(TEXT("action"), Action);
+		StructuredContent->SetStringField(TEXT("blueprint"), Blueprint ? Blueprint->GetPathName() : FString());
+		StructuredContent->SetStringField(TEXT("graph"), Graph ? Graph->GetName() : FString());
+		if (Node)
+		{
+			StructuredContent->SetObjectField(TEXT("node"), DescribeBlueprintNode(Node));
+		}
+		return StructuredContent;
+	}
+
+	UBlueprint* LoadBlueprintAsset(
+		UEditorAssetSubsystem* EditorAssetSubsystem,
+		const FString& BlueprintPath,
+		FString& OutObjectPath,
+		FString& OutFailureReason)
+	{
+		UObject* LoadedAsset = LoadAssetFromAnyPath(EditorAssetSubsystem, BlueprintPath, OutObjectPath, OutFailureReason);
+		if (UBlueprint* Blueprint = Cast<UBlueprint>(LoadedAsset))
+		{
+			return Blueprint;
+		}
+
+		if (UClass* LoadedClass = Cast<UClass>(LoadedAsset))
+		{
+			if (UBlueprint* Blueprint = Cast<UBlueprint>(LoadedClass->ClassGeneratedBy))
+			{
+				return Blueprint;
+			}
+		}
+
+		if (LoadedAsset)
+		{
+			OutFailureReason = FString::Printf(TEXT("Asset '%s' is not a Blueprint."), *OutObjectPath);
+		}
+		return nullptr;
+	}
+
+	UEdGraph* ResolveBlueprintGraph(
+		UBlueprint* Blueprint,
+		const FString& GraphName,
+		bool bCreateEventGraphIfMissing,
+		FString& OutFailureReason)
+	{
+		if (!Blueprint)
+		{
+			OutFailureReason = TEXT("Blueprint is null.");
+			return nullptr;
+		}
+
+		const FString RequestedGraphName = GraphName.TrimStartAndEnd().IsEmpty()
+			? UEdGraphSchema_K2::GN_EventGraph.ToString()
+			: GraphName.TrimStartAndEnd();
+
+		if (RequestedGraphName.Equals(UEdGraphSchema_K2::GN_EventGraph.ToString(), ESearchCase::IgnoreCase))
+		{
+			if (UEdGraph* EventGraph = FBlueprintEditorUtils::FindEventGraph(Blueprint))
+			{
+				return EventGraph;
+			}
+		}
+
+		TArray<UEdGraph*> Graphs;
+		Blueprint->GetAllGraphs(Graphs);
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (Graph && Graph->GetName().Equals(RequestedGraphName, ESearchCase::IgnoreCase))
+			{
+				return Graph;
+			}
+		}
+
+		if (bCreateEventGraphIfMissing && RequestedGraphName.Equals(UEdGraphSchema_K2::GN_EventGraph.ToString(), ESearchCase::IgnoreCase))
+		{
+			UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+				Blueprint,
+				UEdGraphSchema_K2::GN_EventGraph,
+				UEdGraph::StaticClass(),
+				UEdGraphSchema_K2::StaticClass());
+			FBlueprintEditorUtils::AddUbergraphPage(Blueprint, NewGraph);
+			return NewGraph;
+		}
+
+		OutFailureReason = FString::Printf(TEXT("Blueprint graph '%s' was not found in %s."), *RequestedGraphName, *Blueprint->GetPathName());
+		return nullptr;
+	}
+
+	UEdGraphNode* FindBlueprintNodeByGuid(UEdGraph* Graph, const FString& NodeGuidString)
+	{
+		if (!Graph)
+		{
+			return nullptr;
+		}
+
+		FGuid NodeGuid;
+		const FString TrimmedNodeGuid = NodeGuidString.TrimStartAndEnd();
+		if (!FGuid::Parse(TrimmedNodeGuid, NodeGuid)
+			&& !FGuid::ParseExact(TrimmedNodeGuid, EGuidFormats::Digits, NodeGuid))
+		{
+			return nullptr;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && Node->NodeGuid == NodeGuid)
+			{
+				return Node;
+			}
+		}
+
+		return nullptr;
+	}
+
+	UEdGraphPin* FindBlueprintPinByName(UEdGraphNode* Node, const FString& PinName)
+	{
+		if (!Node)
+		{
+			return nullptr;
+		}
+
+		const FString TrimmedPinName = PinName.TrimStartAndEnd();
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin)
+			{
+				continue;
+			}
+
+			if (Pin->PinName.ToString().Equals(TrimmedPinName, ESearchCase::IgnoreCase)
+				|| Pin->GetDisplayName().ToString().Equals(TrimmedPinName, ESearchCase::IgnoreCase))
+			{
+				return Pin;
+			}
+		}
+
+		return nullptr;
+	}
+
+	FName NormalizePinCategory(const FString& PinCategory)
+	{
+		const FString Category = PinCategory.TrimStartAndEnd().ToLower();
+		if (Category == TEXT("exec")) { return UEdGraphSchema_K2::PC_Exec; }
+		if (Category == TEXT("bool") || Category == TEXT("boolean")) { return UEdGraphSchema_K2::PC_Boolean; }
+		if (Category == TEXT("byte")) { return UEdGraphSchema_K2::PC_Byte; }
+		if (Category == TEXT("class")) { return UEdGraphSchema_K2::PC_Class; }
+		if (Category == TEXT("int") || Category == TEXT("integer")) { return UEdGraphSchema_K2::PC_Int; }
+		if (Category == TEXT("int64")) { return UEdGraphSchema_K2::PC_Int64; }
+		if (Category == TEXT("float")) { return UEdGraphSchema_K2::PC_Real; }
+		if (Category == TEXT("double") || Category == TEXT("real")) { return UEdGraphSchema_K2::PC_Real; }
+		if (Category == TEXT("name")) { return UEdGraphSchema_K2::PC_Name; }
+		if (Category == TEXT("object")) { return UEdGraphSchema_K2::PC_Object; }
+		if (Category == TEXT("interface")) { return UEdGraphSchema_K2::PC_Interface; }
+		if (Category == TEXT("string")) { return UEdGraphSchema_K2::PC_String; }
+		if (Category == TEXT("text")) { return UEdGraphSchema_K2::PC_Text; }
+		if (Category == TEXT("struct")) { return UEdGraphSchema_K2::PC_Struct; }
+		if (Category == TEXT("wildcard")) { return UEdGraphSchema_K2::PC_Wildcard; }
+		if (Category == TEXT("enum")) { return UEdGraphSchema_K2::PC_Enum; }
+		if (Category == TEXT("softobject")) { return UEdGraphSchema_K2::PC_SoftObject; }
+		if (Category == TEXT("softclass")) { return UEdGraphSchema_K2::PC_SoftClass; }
+		return FName(*PinCategory.TrimStartAndEnd());
+	}
+
+	UObject* ResolvePinSubCategoryObject(
+		const FName& PinCategory,
+		const FString& SubCategoryObjectPath,
+		UEditorAssetSubsystem* EditorAssetSubsystem,
+		FString& OutFailureReason)
+	{
+		const FString TrimmedPath = SubCategoryObjectPath.TrimStartAndEnd();
+		if (TrimmedPath.IsEmpty())
+		{
+			return nullptr;
+		}
+
+		if (PinCategory == UEdGraphSchema_K2::PC_Object
+			|| PinCategory == UEdGraphSchema_K2::PC_Class
+			|| PinCategory == UEdGraphSchema_K2::PC_Interface
+			|| PinCategory == UEdGraphSchema_K2::PC_SoftObject
+			|| PinCategory == UEdGraphSchema_K2::PC_SoftClass)
+		{
+			if (UClass* Class = ResolveClassPath(TrimmedPath, EditorAssetSubsystem))
+			{
+				return Class;
+			}
+			OutFailureReason = FString::Printf(TEXT("Unable to resolve class subCategoryObjectPath '%s'."), *TrimmedPath);
+			return nullptr;
+		}
+
+		if (PinCategory == UEdGraphSchema_K2::PC_Struct)
+		{
+			if (UScriptStruct* Struct = LoadObject<UScriptStruct>(nullptr, *TrimmedPath))
+			{
+				return Struct;
+			}
+			OutFailureReason = FString::Printf(TEXT("Unable to resolve struct subCategoryObjectPath '%s'."), *TrimmedPath);
+			return nullptr;
+		}
+
+		if (PinCategory == UEdGraphSchema_K2::PC_Enum || PinCategory == UEdGraphSchema_K2::PC_Byte)
+		{
+			if (UEnum* Enum = LoadObject<UEnum>(nullptr, *TrimmedPath))
+			{
+				return Enum;
+			}
+			OutFailureReason = FString::Printf(TEXT("Unable to resolve enum subCategoryObjectPath '%s'."), *TrimmedPath);
+			return nullptr;
+		}
+
+		FString ObjectPath;
+		UObject* LoadedObject = LoadAssetFromAnyPath(EditorAssetSubsystem, TrimmedPath, ObjectPath, OutFailureReason);
+		return LoadedObject;
+	}
+
+	bool BuildBlueprintPinType(
+		const FJsonObject& Arguments,
+		UEditorAssetSubsystem* EditorAssetSubsystem,
+		FEdGraphPinType& OutPinType,
+		FString& OutFailureReason)
+	{
+		FString PinCategoryString = TEXT("bool");
+		Arguments.TryGetStringField(TEXT("pinCategory"), PinCategoryString);
+
+		FName PinCategory = NormalizePinCategory(PinCategoryString);
+		if (PinCategory.IsNone())
+		{
+			OutFailureReason = TEXT("pinCategory cannot be empty.");
+			return false;
+		}
+
+		FString PinSubCategoryString;
+		Arguments.TryGetStringField(TEXT("pinSubCategory"), PinSubCategoryString);
+
+		UObject* PinSubCategoryObject = nullptr;
+		FString SubCategoryObjectPath;
+		if (Arguments.TryGetStringField(TEXT("subCategoryObjectPath"), SubCategoryObjectPath) && !SubCategoryObjectPath.TrimStartAndEnd().IsEmpty())
+		{
+			PinSubCategoryObject = ResolvePinSubCategoryObject(PinCategory, SubCategoryObjectPath, EditorAssetSubsystem, OutFailureReason);
+			if (!PinSubCategoryObject)
+			{
+				return false;
+			}
+		}
+
+		OutPinType = FEdGraphPinType();
+		OutPinType.PinCategory = PinCategory;
+		OutPinType.PinSubCategory = FName(*PinSubCategoryString.TrimStartAndEnd());
+		OutPinType.PinSubCategoryObject = PinSubCategoryObject;
+
+		if (PinCategory == UEdGraphSchema_K2::PC_Real)
+		{
+			const FString Lower = PinCategoryString.ToLower();
+			OutPinType.PinSubCategory = Lower == TEXT("float") ? UEdGraphSchema_K2::PC_Float : UEdGraphSchema_K2::PC_Double;
+		}
+
+		FString ContainerTypeString = TEXT("none");
+		Arguments.TryGetStringField(TEXT("containerType"), ContainerTypeString);
+		ContainerTypeString = ContainerTypeString.TrimStartAndEnd().ToLower();
+		if (ContainerTypeString == TEXT("array"))
+		{
+			OutPinType.ContainerType = EPinContainerType::Array;
+		}
+		else if (ContainerTypeString == TEXT("set"))
+		{
+			OutPinType.ContainerType = EPinContainerType::Set;
+		}
+		else if (ContainerTypeString == TEXT("map"))
+		{
+			OutPinType.ContainerType = EPinContainerType::Map;
+		}
+		else
+		{
+			OutPinType.ContainerType = EPinContainerType::None;
+		}
+
+		return true;
+	}
+
+	UFunction* ResolveFunctionByClassAndName(
+		UEditorAssetSubsystem* EditorAssetSubsystem,
+		const FString& FunctionClassPath,
+		const FString& FunctionName,
+		FString& OutFailureReason)
+	{
+		UClass* FunctionClass = ResolveClassPath(FunctionClassPath, EditorAssetSubsystem);
+		if (!FunctionClass)
+		{
+			OutFailureReason = FString::Printf(TEXT("Unable to resolve functionClassPath '%s'."), *FunctionClassPath);
+			return nullptr;
+		}
+
+		UFunction* Function = FunctionClass->FindFunctionByName(FName(*FunctionName.TrimStartAndEnd()));
+		if (!Function)
+		{
+			OutFailureReason = FString::Printf(TEXT("Function '%s' was not found on class '%s'."), *FunctionName, *FunctionClass->GetPathName());
+			return nullptr;
+		}
+
+		return Function;
+	}
+
+	UEdGraph* FindStandardMacroGraph(const FString& MacroName)
+	{
+		UBlueprint* StandardMacros = LoadObject<UBlueprint>(nullptr, TEXT("/Engine/EditorBlueprintResources/StandardMacros.StandardMacros"));
+		if (!StandardMacros)
+		{
+			StandardMacros = LoadObject<UBlueprint>(nullptr, TEXT("/Engine/EditorBlueprintResources/StandardMacros"));
+		}
+		if (!StandardMacros)
+		{
+			return nullptr;
+		}
+
+		TArray<UEdGraph*> Graphs;
+		StandardMacros->GetAllGraphs(Graphs);
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (Graph && Graph->GetName().Equals(MacroName.TrimStartAndEnd(), ESearchCase::IgnoreCase))
+			{
+				return Graph;
+			}
+		}
+		return nullptr;
+	}
+
+	namespace
+	{
+		UEditorAssetSubsystem* GetEditorAssetSubsystem()
+		{
+			return GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+		}
+
+		void AttachBlueprintToolError(TSharedPtr<FJsonObject> StructuredContent, const FString& Code, const FString& Message)
+		{
+			if (!StructuredContent.IsValid())
+			{
+				return;
+			}
+
+			TSharedPtr<FJsonObject> ErrorObject = MakeShared<FJsonObject>();
+			ErrorObject->SetStringField(TEXT("code"), Code);
+			ErrorObject->SetStringField(TEXT("message"), Message);
+			StructuredContent->SetObjectField(TEXT("error"), ErrorObject);
+		}
+
+		FUnrealMcpExecutionResult MakeBlueprintToolError(
+			const FString& Action,
+			const FString& Code,
+			const FString& Message,
+			const FString& BlueprintPath,
+			const FString& GraphName = FString())
+		{
+			TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+			StructuredContent->SetStringField(TEXT("action"), Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			if (!GraphName.IsEmpty())
+			{
+				StructuredContent->SetStringField(TEXT("graphName"), GraphName);
+			}
+			AttachBlueprintToolError(StructuredContent, Code, Message);
+			return MakeExecutionResult(Message, StructuredContent, true);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> BlueprintToolMakeStringArray(const TArray<FString>& Values)
+		{
+			TArray<TSharedPtr<FJsonValue>> JsonValues;
+			for (const FString& Value : Values)
+			{
+				JsonValues.Add(MakeShared<FJsonValueString>(Value));
+			}
+			return JsonValues;
+		}
+
+		bool BlueprintToolReadEventGraphName(const FJsonObject& Arguments, FString& OutGraphName, FString& OutFailureReason)
+		{
+			OutGraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			Arguments.TryGetStringField(TEXT("graphName"), OutGraphName);
+			OutGraphName = OutGraphName.TrimStartAndEnd().IsEmpty()
+				? UEdGraphSchema_K2::GN_EventGraph.ToString()
+				: OutGraphName.TrimStartAndEnd();
+			if (!OutGraphName.Equals(UEdGraphSchema_K2::GN_EventGraph.ToString(), ESearchCase::IgnoreCase))
+			{
+				OutFailureReason = FString::Printf(TEXT("Only EventGraph is supported for this tool in this release; requested graphName '%s'."), *OutGraphName);
+				return false;
+			}
+
+			OutFailureReason.Reset();
+			return true;
+		}
+
+		FVector2D BlueprintToolReadGraphLocation(const FJsonObject& Arguments)
+		{
+			double X = 0.0;
+			double Y = 0.0;
+			Arguments.TryGetNumberField(TEXT("x"), X);
+			Arguments.TryGetNumberField(TEXT("y"), Y);
+			return FVector2D(X, Y);
+		}
+
+		TSharedPtr<FJsonObject> BlueprintToolMakeCreatedNodeContent(
+			UBlueprint* Blueprint,
+			const FString& Action,
+			const FString& BlueprintPath,
+			const FString& NodeGuid,
+			const TArray<FString>& PinNames)
+		{
+			FString GraphFailureReason;
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, UEdGraphSchema_K2::GN_EventGraph.ToString(), false, GraphFailureReason);
+			UEdGraphNode* Node = Graph ? FindBlueprintNodeByGuid(Graph, NodeGuid) : nullptr;
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, Node, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("nodeGuid"), NodeGuid);
+			StructuredContent->SetArrayField(TEXT("pinNames"), BlueprintToolMakeStringArray(PinNames));
+			StructuredContent->SetBoolField(TEXT("postcheckFoundNode"), Node != nullptr);
+			if (!GraphFailureReason.IsEmpty())
+			{
+				StructuredContent->SetStringField(TEXT("postcheckNotes"), GraphFailureReason);
+			}
+			return StructuredContent;
+		}
+
+		bool BlueprintToolLoadBlueprintForWrite(
+			const FJsonObject& Arguments,
+			const FString& Action,
+			FString& OutBlueprintPath,
+			FString& OutObjectPath,
+			UBlueprint*& OutBlueprint,
+			FUnrealMcpExecutionResult& OutErrorResult)
+		{
+			OutBlueprintPath.Reset();
+			OutObjectPath.Reset();
+			OutBlueprint = nullptr;
+
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), OutBlueprintPath) || OutBlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				OutErrorResult = MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+				return false;
+			}
+			OutBlueprintPath = OutBlueprintPath.TrimStartAndEnd();
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				OutErrorResult = MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+				return false;
+			}
+
+			FString FailureReason;
+			OutBlueprint = LoadBlueprintAsset(EditorAssetSubsystem, OutBlueprintPath, OutObjectPath, FailureReason);
+			if (!OutBlueprint)
+			{
+				OutErrorResult = MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, OutBlueprintPath);
+				return false;
+			}
+
+			return true;
+		}
+
+		const FBPVariableDescription* FindMemberVariableDescription(UBlueprint* Blueprint, const FName VariableName)
+		{
+			if (!Blueprint || VariableName.IsNone())
+			{
+				return nullptr;
+			}
+
+			const int32 VariableIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VariableName);
+			return Blueprint->NewVariables.IsValidIndex(VariableIndex) ? &Blueprint->NewVariables[VariableIndex] : nullptr;
+		}
+
+		bool IsMemberReferenceOwnedByBlueprint(const FMemberReference& Reference, UBlueprint* Blueprint)
+		{
+			if (!Blueprint)
+			{
+				return false;
+			}
+
+			if (Reference.IsSelfContext())
+			{
+				return true;
+			}
+
+			UClass* ParentClass = Reference.GetMemberParentClass(Blueprint->GeneratedClass);
+			if (!ParentClass)
+			{
+				return false;
+			}
+
+			if (ParentClass == Blueprint->GeneratedClass || ParentClass == Blueprint->SkeletonGeneratedClass)
+			{
+				return true;
+			}
+
+			return UBlueprint::GetBlueprintFromClass(ParentClass) == Blueprint;
+		}
+
+		int32 CountVariableReferenceNodes(UBlueprint* Blueprint, const FName VariableName)
+		{
+			if (!Blueprint || VariableName.IsNone())
+			{
+				return 0;
+			}
+
+			int32 ReferenceCount = 0;
+			TArray<UEdGraph*> Graphs;
+			Blueprint->GetAllGraphs(Graphs);
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (!Graph)
+				{
+					continue;
+				}
+
+				for (UEdGraphNode* Node : Graph->Nodes)
+				{
+					UK2Node_Variable* VariableNode = Cast<UK2Node_Variable>(Node);
+					if (VariableNode
+						&& VariableNode->GetVarName() == VariableName
+						&& IsMemberReferenceOwnedByBlueprint(VariableNode->VariableReference, Blueprint))
+					{
+						++ReferenceCount;
+					}
+				}
+			}
+
+			return ReferenceCount;
+		}
+
+		int32 CountFunctionCallerNodes(UBlueprint* Blueprint, const FName FunctionName)
+		{
+			if (!Blueprint || FunctionName.IsNone())
+			{
+				return 0;
+			}
+
+			int32 CallerCount = 0;
+			TArray<UEdGraph*> Graphs;
+			Blueprint->GetAllGraphs(Graphs);
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (!Graph)
+				{
+					continue;
+				}
+
+				for (UEdGraphNode* Node : Graph->Nodes)
+				{
+					UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(Node);
+					if (CallNode
+						&& CallNode->GetFunctionName() == FunctionName
+						&& IsMemberReferenceOwnedByBlueprint(CallNode->FunctionReference, Blueprint))
+					{
+						++CallerCount;
+					}
+				}
+			}
+
+			return CallerCount;
+		}
+
+		bool IsReservedBlueprintIdentifier(const FString& Name)
+		{
+			const FString LowerName = Name.ToLower();
+			static const TCHAR* ReservedWords[] = {
+				TEXT("alignas"), TEXT("alignof"), TEXT("and"), TEXT("and_eq"), TEXT("asm"), TEXT("auto"),
+				TEXT("bitand"), TEXT("bitor"), TEXT("bool"), TEXT("break"), TEXT("case"), TEXT("catch"),
+				TEXT("char"), TEXT("class"), TEXT("compl"), TEXT("const"), TEXT("constexpr"), TEXT("const_cast"),
+				TEXT("continue"), TEXT("decltype"), TEXT("default"), TEXT("delete"), TEXT("do"), TEXT("double"),
+				TEXT("dynamic_cast"), TEXT("else"), TEXT("enum"), TEXT("explicit"), TEXT("export"), TEXT("extern"),
+				TEXT("false"), TEXT("float"), TEXT("for"), TEXT("friend"), TEXT("goto"), TEXT("if"),
+				TEXT("inline"), TEXT("int"), TEXT("long"), TEXT("mutable"), TEXT("namespace"), TEXT("new"),
+				TEXT("noexcept"), TEXT("not"), TEXT("not_eq"), TEXT("nullptr"), TEXT("operator"), TEXT("or"),
+				TEXT("or_eq"), TEXT("private"), TEXT("protected"), TEXT("public"), TEXT("register"),
+				TEXT("reinterpret_cast"), TEXT("return"), TEXT("short"), TEXT("signed"), TEXT("sizeof"),
+				TEXT("static"), TEXT("static_assert"), TEXT("static_cast"), TEXT("struct"), TEXT("switch"),
+				TEXT("template"), TEXT("this"), TEXT("thread_local"), TEXT("throw"), TEXT("true"), TEXT("try"),
+				TEXT("typedef"), TEXT("typeid"), TEXT("typename"), TEXT("union"), TEXT("unsigned"), TEXT("using"),
+				TEXT("virtual"), TEXT("void"), TEXT("volatile"), TEXT("wchar_t"), TEXT("while"), TEXT("xor"),
+				TEXT("xor_eq"), TEXT("self"), TEXT("none")
+			};
+
+			for (const TCHAR* ReservedWord : ReservedWords)
+			{
+				if (LowerName == ReservedWord)
+				{
+					return true;
+				}
+			}
+			return false;
+		}
+
+		bool ValidateBlueprintIdentifier(const FString& RawName, FString& OutReason)
+		{
+			const FString Name = RawName.TrimStartAndEnd();
+			if (Name.IsEmpty())
+			{
+				OutReason = TEXT("not-an-identifier");
+				return false;
+			}
+
+			if (!(FChar::IsAlpha(Name[0]) || Name[0] == TEXT('_')))
+			{
+				OutReason = TEXT("not-an-identifier");
+				return false;
+			}
+
+			for (int32 Index = 1; Index < Name.Len(); ++Index)
+			{
+				if (!(FChar::IsAlnum(Name[Index]) || Name[Index] == TEXT('_')))
+				{
+					OutReason = TEXT("not-an-identifier");
+					return false;
+				}
+			}
+
+			if (IsReservedBlueprintIdentifier(Name))
+			{
+				OutReason = TEXT("reserved-word");
+				return false;
+			}
+
+			OutReason.Reset();
+			return true;
+		}
+
+		bool IsProtectedFunctionGraphName(const FString& FunctionName)
+		{
+			const FString TrimmedName = FunctionName.TrimStartAndEnd();
+			return TrimmedName.Equals(UEdGraphSchema_K2::GN_EventGraph.ToString(), ESearchCase::IgnoreCase)
+				|| TrimmedName.Equals(TEXT("ConstructionScript"), ESearchCase::IgnoreCase)
+				|| TrimmedName.Equals(UEdGraphSchema_K2::FN_UserConstructionScript.ToString(), ESearchCase::IgnoreCase);
+		}
+
+		UEdGraph* FindFunctionGraphByName(UBlueprint* Blueprint, const FString& FunctionName)
+		{
+			if (!Blueprint)
+			{
+				return nullptr;
+			}
+
+			const FString TrimmedName = FunctionName.TrimStartAndEnd();
+			for (UEdGraph* FunctionGraph : Blueprint->FunctionGraphs)
+			{
+				if (FunctionGraph && FunctionGraph->GetName().Equals(TrimmedName, ESearchCase::IgnoreCase))
+				{
+					return FunctionGraph;
+				}
+			}
+			return nullptr;
+		}
+
+		UEdGraph* FindAnyBlueprintGraphByName(UBlueprint* Blueprint, const FString& GraphName)
+		{
+			if (!Blueprint)
+			{
+				return nullptr;
+			}
+
+			const FString TrimmedName = GraphName.TrimStartAndEnd();
+			TArray<UEdGraph*> Graphs;
+			Blueprint->GetAllGraphs(Graphs);
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (Graph && Graph->GetName().Equals(TrimmedName, ESearchCase::IgnoreCase))
+				{
+					return Graph;
+				}
+			}
+			return nullptr;
+		}
+
+		UEdGraph* FindMacroGraphByName(UBlueprint* Blueprint, const FString& MacroName)
+		{
+			if (!Blueprint)
+			{
+				return nullptr;
+			}
+
+			const FString TrimmedName = MacroName.TrimStartAndEnd();
+			for (UEdGraph* MacroGraph : Blueprint->MacroGraphs)
+			{
+				if (MacroGraph && MacroGraph->GetName().Equals(TrimmedName, ESearchCase::IgnoreCase))
+				{
+					return MacroGraph;
+				}
+			}
+			return nullptr;
+		}
+
+		int32 CountMacroInstanceReferences(UBlueprint* Blueprint, UEdGraph* MacroGraph)
+		{
+			if (!Blueprint || !MacroGraph)
+			{
+				return 0;
+			}
+
+			int32 ReferenceCount = 0;
+			TArray<UEdGraph*> Graphs;
+			Blueprint->GetAllGraphs(Graphs);
+			for (UEdGraph* Graph : Graphs)
+			{
+				if (!Graph)
+				{
+					continue;
+				}
+
+				for (UEdGraphNode* Node : Graph->Nodes)
+				{
+					UK2Node_MacroInstance* MacroNode = Cast<UK2Node_MacroInstance>(Node);
+					if (MacroNode && MacroNode->GetMacroGraph() == MacroGraph)
+					{
+						++ReferenceCount;
+					}
+				}
+			}
+
+			return ReferenceCount;
+		}
+
+		FBPInterfaceDescription* FindImplementedInterfaceDescription(UBlueprint* Blueprint, UClass* InterfaceClass)
+		{
+			if (!Blueprint || !InterfaceClass)
+			{
+				return nullptr;
+			}
+
+			for (FBPInterfaceDescription& InterfaceDescription : Blueprint->ImplementedInterfaces)
+			{
+				UClass* ImplementedClass = InterfaceDescription.Interface.Get();
+				if (ImplementedClass
+					&& (ImplementedClass == InterfaceClass || ImplementedClass->GetClassPathName() == InterfaceClass->GetClassPathName()))
+				{
+					return &InterfaceDescription;
+				}
+			}
+			return nullptr;
+		}
+
+		int32 CountInterfaceFunctions(const UClass* InterfaceClass)
+		{
+			if (!InterfaceClass)
+			{
+				return 0;
+			}
+
+			int32 FunctionCount = 0;
+			for (TFieldIterator<UFunction> FunctionIter(InterfaceClass, EFieldIteratorFlags::ExcludeSuper); FunctionIter; ++FunctionIter)
+			{
+				if (*FunctionIter)
+				{
+					++FunctionCount;
+				}
+			}
+			return FunctionCount;
+		}
+
+		FUnrealMcpExecutionResult AddVariableTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_variable");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString VariableName;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("name"), VariableName) || VariableName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'name'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			FEdGraphPinType PinType;
+			if (!BuildBlueprintPinType(Arguments, EditorAssetSubsystem, PinType, FailureReason))
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			FString DefaultValue;
+			Arguments.TryGetStringField(TEXT("defaultValue"), DefaultValue);
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddVariable", "Unreal MCP Add Blueprint Variable"));
+			Blueprint->Modify();
+			const FName VarFName(*VariableName.TrimStartAndEnd());
+			const bool bAdded = FBlueprintEditorUtils::AddMemberVariable(Blueprint, VarFName, PinType, DefaultValue);
+			if (!bAdded)
+			{
+				return MakeExecutionResult(
+					FString::Printf(TEXT("Failed to add variable '%s' to %s. It may already exist or conflict with a parent member."), *VariableName, *ObjectPath),
+					nullptr,
+					true);
+			}
+
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, TEXT("bp_add_variable"));
+			StructuredContent->SetStringField(TEXT("variableName"), VarFName.ToString());
+			StructuredContent->SetStringField(TEXT("pinCategory"), PinType.PinCategory.ToString());
+			StructuredContent->SetStringField(TEXT("pinSubCategory"), PinType.PinSubCategory.ToString());
+			StructuredContent->SetStringField(TEXT("defaultValue"), DefaultValue);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added Blueprint variable %s to %s."), *VarFName.ToString(), *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddFunctionTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_function");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString FunctionName;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("functionName"), FunctionName) || FunctionName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'functionName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			TArray<UEdGraph*> Graphs;
+			Blueprint->GetAllGraphs(Graphs);
+			for (UEdGraph* ExistingGraph : Graphs)
+			{
+				if (ExistingGraph && ExistingGraph->GetName().Equals(FunctionName.TrimStartAndEnd(), ESearchCase::IgnoreCase))
+				{
+					TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, ExistingGraph, nullptr, TEXT("bp_add_function"));
+					StructuredContent->SetBoolField(TEXT("created"), false);
+					return MakeExecutionResult(
+						FString::Printf(TEXT("Function graph %s already exists in %s."), *ExistingGraph->GetName(), *ObjectPath),
+						StructuredContent,
+						false);
+				}
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddFunction", "Unreal MCP Add Blueprint Function"));
+			Blueprint->Modify();
+			UEdGraph* FunctionGraph = FBlueprintEditorUtils::CreateNewGraph(
+				Blueprint,
+				FName(*FunctionName.TrimStartAndEnd()),
+				UEdGraph::StaticClass(),
+				UEdGraphSchema_K2::StaticClass());
+			FBlueprintEditorUtils::AddFunctionGraph<UClass>(Blueprint, FunctionGraph, true, nullptr);
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, FunctionGraph, nullptr, TEXT("bp_add_function"));
+			StructuredContent->SetBoolField(TEXT("created"), true);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Created function graph %s in %s."), *FunctionGraph->GetName(), *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddMacroGraphTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_macro_graph");
+			const FString Action = TEXT("bp_add_macro_graph");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString MacroName;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("macroName"), MacroName);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			MacroName = MacroName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (MacroName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'macroName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			FString InvalidReason;
+			if (!ValidateBlueprintIdentifier(MacroName, InvalidReason))
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+				StructuredContent->SetStringField(TEXT("action"), Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("macroName"), MacroName);
+				StructuredContent->SetStringField(TEXT("reason"), InvalidReason);
+				AttachBlueprintToolError(
+					StructuredContent,
+					TEXT("INVALID_NAME"),
+					FString::Printf(TEXT("Macro graph name '%s' is invalid: %s."), *MacroName, *InvalidReason));
+				return MakeExecutionResult(FString::Printf(TEXT("Invalid macro graph name '%s': %s."), *MacroName, *InvalidReason), StructuredContent, true);
+			}
+
+			const FName MacroFName(*MacroName);
+			if (FindAnyBlueprintGraphByName(Blueprint, MacroName) || FindMemberVariableDescription(Blueprint, MacroFName))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("RENAME_COLLISION"),
+					FString::Printf(TEXT("A Blueprint graph, macro, function, or variable named '%s' already exists in %s."), *MacroName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddMacroGraph", "Unreal MCP Add Blueprint Macro Graph"));
+			Blueprint->Modify();
+			UEdGraph* MacroGraph = FBlueprintEditorUtils::CreateNewGraph(
+				Blueprint,
+				MacroFName,
+				UEdGraph::StaticClass(),
+				UEdGraphSchema_K2::StaticClass());
+			if (!MacroGraph)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Failed to create macro graph '%s' in %s."), *MacroName, *ObjectPath), nullptr, true);
+			}
+
+			FBlueprintEditorUtils::AddMacroGraph(Blueprint, MacroGraph, true, nullptr);
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, MacroGraph, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("macroName"), MacroName);
+			StructuredContent->SetStringField(TEXT("graphName"), MacroGraph->GetName());
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Created Blueprint macro graph %s in %s."), *MacroGraph->GetName(), *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult DeleteMacroGraphTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_delete_macro_graph");
+			const FString Action = TEXT("bp_delete_macro_graph");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString MacroName;
+			bool bForce = false;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("macroName"), MacroName);
+			Arguments.TryGetBoolField(TEXT("force"), bForce);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			MacroName = MacroName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (MacroName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'macroName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			UEdGraph* MacroGraph = FindMacroGraphByName(Blueprint, MacroName);
+			if (!MacroGraph)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("MACRO_NOT_FOUND"),
+					FString::Printf(TEXT("Macro graph '%s' was not found in %s."), *MacroName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const int32 ReferenceCount = CountMacroInstanceReferences(Blueprint, MacroGraph);
+			if (ReferenceCount > 0 && !bForce)
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+				StructuredContent->SetStringField(TEXT("action"), Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("macroName"), MacroName);
+				StructuredContent->SetNumberField(TEXT("referenceCount"), ReferenceCount);
+				StructuredContent->SetNumberField(TEXT("referencesRemoved"), 0);
+				AttachBlueprintToolError(
+					StructuredContent,
+					TEXT("REFERENCES_PRESENT"),
+					FString::Printf(TEXT("Macro graph '%s' has %d macro instance reference(s). Pass force=true to delete the graph and remove those nodes."), *MacroName, ReferenceCount));
+				return MakeExecutionResult(
+					FString::Printf(TEXT("Macro graph '%s' has %d macro instance reference(s)."), *MacroName, ReferenceCount),
+					StructuredContent,
+					true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpDeleteMacroGraph", "Unreal MCP Delete Blueprint Macro Graph"));
+			Blueprint->Modify();
+			MacroGraph->Modify();
+			FBlueprintEditorUtils::RemoveGraph(Blueprint, MacroGraph, EGraphRemoveFlags::Recompile);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("macroName"), MacroName);
+			StructuredContent->SetNumberField(TEXT("referenceCount"), ReferenceCount);
+			StructuredContent->SetNumberField(TEXT("referencesRemoved"), bForce ? ReferenceCount : 0);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Deleted Blueprint macro graph %s from %s."), *MacroName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddInterfaceTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_interface_add");
+			const FString Action = TEXT("bp_interface_add");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString InterfacePath;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("interfacePath"), InterfacePath);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			InterfacePath = InterfacePath.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (InterfacePath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'interfacePath'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			UClass* InterfaceClass = ResolveClassPath(InterfacePath, EditorAssetSubsystem);
+			if (!InterfaceClass)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("INTERFACE_NOT_FOUND"),
+					FString::Printf(TEXT("Unable to resolve interface class path '%s'."), *InterfacePath),
+					BlueprintPath);
+			}
+
+			const FString InterfaceName = InterfaceClass->GetName();
+			if (!InterfaceClass->IsChildOf(UInterface::StaticClass())
+				|| !FKismetEditorUtilities::CanBlueprintImplementInterface(Blueprint, InterfaceClass)
+				|| FindImplementedInterfaceDescription(Blueprint, InterfaceClass))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("INTERFACE_NOT_USABLE"),
+					FString::Printf(TEXT("Interface '%s' cannot be added to %s because it is not Blueprint-implementable or is already implemented."), *InterfaceClass->GetPathName(), *ObjectPath),
+					BlueprintPath);
+			}
+
+			const int32 FunctionCount = CountInterfaceFunctions(InterfaceClass);
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpInterfaceAdd", "Unreal MCP Add Blueprint Interface"));
+			Blueprint->Modify();
+			const bool bImplemented = FBlueprintEditorUtils::ImplementNewInterface(Blueprint, InterfaceClass->GetClassPathName());
+			if (!bImplemented)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("INTERFACE_NOT_USABLE"),
+					FString::Printf(TEXT("Interface '%s' could not be implemented by %s."), *InterfaceClass->GetPathName(), *ObjectPath),
+					BlueprintPath);
+			}
+			FBlueprintEditorUtils::ConformImplementedInterfaces(Blueprint);
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("interfacePath"), InterfacePath);
+			StructuredContent->SetStringField(TEXT("interfaceName"), InterfaceName);
+			StructuredContent->SetNumberField(TEXT("functionCount"), FunctionCount);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added interface %s to %s."), *InterfaceName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult RemoveInterfaceTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_interface_remove");
+			const FString Action = TEXT("bp_interface_remove");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString InterfacePath;
+			bool bPreserveFunctions = false;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("interfacePath"), InterfacePath);
+			Arguments.TryGetBoolField(TEXT("preserveFunctions"), bPreserveFunctions);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			InterfacePath = InterfacePath.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (InterfacePath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'interfacePath'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			UClass* InterfaceClass = ResolveClassPath(InterfacePath, EditorAssetSubsystem);
+			if (!InterfaceClass || !InterfaceClass->IsChildOf(UInterface::StaticClass()))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("INTERFACE_NOT_FOUND"),
+					FString::Printf(TEXT("Interface '%s' is not implemented by %s."), *InterfacePath, *ObjectPath),
+					BlueprintPath);
+			}
+
+			FBPInterfaceDescription* InterfaceDescription = FindImplementedInterfaceDescription(Blueprint, InterfaceClass);
+			if (!InterfaceDescription)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("INTERFACE_NOT_FOUND"),
+					FString::Printf(TEXT("Interface '%s' is not implemented by %s."), *InterfaceClass->GetPathName(), *ObjectPath),
+					BlueprintPath);
+			}
+
+			const FString InterfaceName = InterfaceClass->GetName();
+			const int32 InterfaceGraphCount = InterfaceDescription->Graphs.Num();
+			const int32 FunctionsPreserved = bPreserveFunctions ? InterfaceGraphCount : 0;
+			const int32 FunctionsDeleted = bPreserveFunctions ? 0 : InterfaceGraphCount;
+
+			FBlueprintEditorUtils::RemoveInterface(Blueprint, InterfaceClass->GetClassPathName(), bPreserveFunctions);
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("interfacePath"), InterfacePath);
+			StructuredContent->SetStringField(TEXT("interfaceName"), InterfaceName);
+			StructuredContent->SetNumberField(TEXT("functionsPreserved"), FunctionsPreserved);
+			StructuredContent->SetNumberField(TEXT("functionsDeleted"), FunctionsDeleted);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Removed interface %s from %s."), *InterfaceName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult DeleteNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_delete_node");
+			const FString Action = TEXT("bp_delete_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			FString NodeGuid;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetStringField(TEXT("nodeGuid"), NodeGuid);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			GraphName = GraphName.TrimStartAndEnd().IsEmpty() ? UEdGraphSchema_K2::GN_EventGraph.ToString() : GraphName.TrimStartAndEnd();
+			NodeGuid = NodeGuid.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (NodeGuid.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'nodeGuid'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+			if (!Graph)
+			{
+				return MakeBlueprintToolError(Action, TEXT("GRAPH_NOT_FOUND"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			UEdGraphNode* Node = FindBlueprintNodeByGuid(Graph, NodeGuid);
+			if (!Node)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("NODE_NOT_FOUND"),
+					FString::Printf(TEXT("Node '%s' was not found in graph '%s'."), *NodeGuid, *Graph->GetName()),
+					BlueprintPath,
+					Graph->GetName());
+			}
+
+			if (!Node->CanUserDeleteNode())
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("NODE_NOT_DELETABLE"),
+					FString::Printf(TEXT("Node '%s' in graph '%s' cannot be deleted by users."), *NodeGuid, *Graph->GetName()),
+					BlueprintPath,
+					Graph->GetName());
+			}
+
+			int32 PinDisconnects = 0;
+			for (const UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin)
+				{
+					PinDisconnects += Pin->LinkedTo.Num();
+				}
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpDeleteNode", "Unreal MCP Delete Blueprint Node"));
+			Blueprint->Modify();
+			Graph->Modify();
+			Node->Modify();
+			FBlueprintEditorUtils::RemoveNode(Blueprint, Node);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("graphName"), Graph->GetName());
+			StructuredContent->SetStringField(TEXT("nodeGuid"), NodeGuid);
+			StructuredContent->SetNumberField(TEXT("pinDisconnects"), PinDisconnects);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Deleted Blueprint node %s from %s.%s."), *NodeGuid, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult DeleteVariableTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_delete_variable");
+			const FString Action = TEXT("bp_delete_variable");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString VariableName;
+			bool bForce = false;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("variableName"), VariableName);
+			Arguments.TryGetBoolField(TEXT("force"), bForce);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			VariableName = VariableName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (VariableName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'variableName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			const FName VariableFName(*VariableName);
+			const FBPVariableDescription* VariableDescription = FindMemberVariableDescription(Blueprint, VariableFName);
+			if (!VariableDescription)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("VARIABLE_NOT_FOUND"),
+					FString::Printf(TEXT("Variable '%s' was not found in %s."), *VariableName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const FString PinType = VariableDescription->VarType.PinCategory.ToString();
+			const int32 ReferenceCount = CountVariableReferenceNodes(Blueprint, VariableFName);
+			if (ReferenceCount > 0 && !bForce)
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+				StructuredContent->SetStringField(TEXT("action"), Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("variableName"), VariableName);
+				StructuredContent->SetNumberField(TEXT("referenceCount"), ReferenceCount);
+				StructuredContent->SetNumberField(TEXT("referencesRemoved"), 0);
+				StructuredContent->SetStringField(TEXT("pinType"), PinType);
+				AttachBlueprintToolError(
+					StructuredContent,
+					TEXT("REFERENCES_PRESENT"),
+					FString::Printf(TEXT("Variable '%s' has %d reference node(s). Pass force=true to remove the variable and its references."), *VariableName, ReferenceCount));
+				return MakeExecutionResult(
+					FString::Printf(TEXT("Variable '%s' has %d reference node(s)."), *VariableName, ReferenceCount),
+					StructuredContent,
+					true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpDeleteVariable", "Unreal MCP Delete Blueprint Variable"));
+			Blueprint->Modify();
+			FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, VariableFName);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("variableName"), VariableName);
+			StructuredContent->SetNumberField(TEXT("referenceCount"), ReferenceCount);
+			StructuredContent->SetNumberField(TEXT("referencesRemoved"), bForce ? ReferenceCount : 0);
+			StructuredContent->SetStringField(TEXT("pinType"), PinType);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Deleted Blueprint variable %s from %s."), *VariableName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult DeleteFunctionTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_delete_function");
+			const FString Action = TEXT("bp_delete_function");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString FunctionName;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("functionName"), FunctionName);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			FunctionName = FunctionName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (FunctionName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'functionName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			if (IsProtectedFunctionGraphName(FunctionName))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("FUNCTION_NOT_DELETABLE"),
+					FString::Printf(TEXT("Function graph '%s' is a built-in Blueprint graph and cannot be deleted."), *FunctionName),
+					BlueprintPath);
+			}
+
+			UEdGraph* FunctionGraph = FindFunctionGraphByName(Blueprint, FunctionName);
+			if (!FunctionGraph)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("FUNCTION_NOT_FOUND"),
+					FString::Printf(TEXT("Function graph '%s' was not found in %s."), *FunctionName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const int32 CallerCount = CountFunctionCallerNodes(Blueprint, FunctionGraph->GetFName());
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpDeleteFunction", "Unreal MCP Delete Blueprint Function"));
+			Blueprint->Modify();
+			FunctionGraph->Modify();
+			FBlueprintEditorUtils::RemoveGraph(Blueprint, FunctionGraph, EGraphRemoveFlags::Default);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("functionName"), FunctionName);
+			StructuredContent->SetNumberField(TEXT("callerCount"), CallerCount);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Deleted Blueprint function graph %s from %s."), *FunctionName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult RenameVariableTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_rename_variable");
+			const FString Action = TEXT("bp_rename_variable");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString OldName;
+			FString NewName;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("oldName"), OldName);
+			Arguments.TryGetStringField(TEXT("newName"), NewName);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			OldName = OldName.TrimStartAndEnd();
+			NewName = NewName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (OldName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'oldName'."), nullptr, true);
+			}
+			if (NewName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'newName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			FString InvalidReason;
+			if (!ValidateBlueprintIdentifier(NewName, InvalidReason))
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+				StructuredContent->SetStringField(TEXT("action"), Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("oldName"), OldName);
+				StructuredContent->SetStringField(TEXT("newName"), NewName);
+				StructuredContent->SetStringField(TEXT("reason"), InvalidReason);
+				AttachBlueprintToolError(
+					StructuredContent,
+					TEXT("INVALID_NAME"),
+					FString::Printf(TEXT("Variable name '%s' is invalid: %s."), *NewName, *InvalidReason));
+				return MakeExecutionResult(FString::Printf(TEXT("Invalid variable name '%s': %s."), *NewName, *InvalidReason), StructuredContent, true);
+			}
+
+			const FName OldFName(*OldName);
+			const FName NewFName(*NewName);
+			if (!FindMemberVariableDescription(Blueprint, OldFName))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("VARIABLE_NOT_FOUND"),
+					FString::Printf(TEXT("Variable '%s' was not found in %s."), *OldName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			if (OldFName == NewFName)
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("oldName"), OldName);
+				StructuredContent->SetStringField(TEXT("newName"), NewName);
+				StructuredContent->SetNumberField(TEXT("referencesUpdated"), 0);
+				return MakeExecutionResult(FString::Printf(TEXT("Blueprint variable %s already has the requested name."), *OldName), StructuredContent, false);
+			}
+
+			if (FindMemberVariableDescription(Blueprint, NewFName))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("RENAME_COLLISION"),
+					FString::Printf(TEXT("Variable '%s' already exists in %s."), *NewName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const int32 ReferencesUpdated = CountVariableReferenceNodes(Blueprint, OldFName);
+			FBlueprintEditorUtils::RenameMemberVariable(Blueprint, OldFName, NewFName);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("oldName"), OldName);
+			StructuredContent->SetStringField(TEXT("newName"), NewName);
+			StructuredContent->SetNumberField(TEXT("referencesUpdated"), ReferencesUpdated);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Renamed Blueprint variable %s to %s in %s."), *OldName, *NewName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult RenameFunctionTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_rename_function");
+			const FString Action = TEXT("bp_rename_function");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString OldName;
+			FString NewName;
+			Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+			Arguments.TryGetStringField(TEXT("oldName"), OldName);
+			Arguments.TryGetStringField(TEXT("newName"), NewName);
+
+			BlueprintPath = BlueprintPath.TrimStartAndEnd();
+			OldName = OldName.TrimStartAndEnd();
+			NewName = NewName.TrimStartAndEnd();
+			if (BlueprintPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (OldName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'oldName'."), nullptr, true);
+			}
+			if (NewName.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'newName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeBlueprintToolError(Action, TEXT("BLUEPRINT_NOT_FOUND"), FailureReason, BlueprintPath);
+			}
+
+			if (IsProtectedFunctionGraphName(OldName))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("FUNCTION_NOT_RENAMABLE"),
+					FString::Printf(TEXT("Function graph '%s' is a built-in Blueprint graph and cannot be renamed."), *OldName),
+					BlueprintPath);
+			}
+
+			UEdGraph* FunctionGraph = FindFunctionGraphByName(Blueprint, OldName);
+			if (!FunctionGraph)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("FUNCTION_NOT_FOUND"),
+					FString::Printf(TEXT("Function graph '%s' was not found in %s."), *OldName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			FString InvalidReason;
+			if (!ValidateBlueprintIdentifier(NewName, InvalidReason))
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+				StructuredContent->SetStringField(TEXT("action"), Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("oldName"), OldName);
+				StructuredContent->SetStringField(TEXT("newName"), NewName);
+				StructuredContent->SetStringField(TEXT("reason"), InvalidReason);
+				AttachBlueprintToolError(
+					StructuredContent,
+					TEXT("INVALID_NAME"),
+					FString::Printf(TEXT("Function name '%s' is invalid: %s."), *NewName, *InvalidReason));
+				return MakeExecutionResult(FString::Printf(TEXT("Invalid function name '%s': %s."), *NewName, *InvalidReason), StructuredContent, true);
+			}
+
+			if (OldName.Equals(NewName, ESearchCase::CaseSensitive))
+			{
+				TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, FunctionGraph, nullptr, Action);
+				StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+				StructuredContent->SetStringField(TEXT("oldName"), OldName);
+				StructuredContent->SetStringField(TEXT("newName"), NewName);
+				StructuredContent->SetNumberField(TEXT("callerCount"), 0);
+				return MakeExecutionResult(FString::Printf(TEXT("Blueprint function %s already has the requested name."), *OldName), StructuredContent, false);
+			}
+
+			UEdGraph* CollisionGraph = FindAnyBlueprintGraphByName(Blueprint, NewName);
+			if (IsProtectedFunctionGraphName(NewName) || (CollisionGraph && CollisionGraph != FunctionGraph))
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("RENAME_COLLISION"),
+					FString::Printf(TEXT("Graph or function '%s' already exists in %s."), *NewName, *ObjectPath),
+					BlueprintPath);
+			}
+
+			const int32 CallerCount = CountFunctionCallerNodes(Blueprint, FunctionGraph->GetFName());
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpRenameFunction", "Unreal MCP Rename Blueprint Function"));
+			Blueprint->Modify();
+			FunctionGraph->Modify();
+			FBlueprintEditorUtils::RenameGraph(FunctionGraph, NewName);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, FunctionGraph, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("oldName"), OldName);
+			StructuredContent->SetStringField(TEXT("newName"), NewName);
+			StructuredContent->SetNumberField(TEXT("callerCount"), CallerCount);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Renamed Blueprint function %s to %s in %s."), *OldName, *NewName, *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddEventNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_event_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			FString EventName = TEXT("ReceiveBeginPlay");
+			FString OwnerClassPath = TEXT("/Script/Engine.Actor");
+			double X = 0.0;
+			double Y = 0.0;
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetStringField(TEXT("eventName"), EventName);
+			Arguments.TryGetStringField(TEXT("ownerClassPath"), OwnerClassPath);
+			Arguments.TryGetNumberField(TEXT("x"), X);
+			Arguments.TryGetNumberField(TEXT("y"), Y);
+
+			if (EventName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'eventName'."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, true, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			const FName EventFName(*EventName.TrimStartAndEnd());
+			UEdGraphNode* NewNode = nullptr;
+			const bool bCustomEvent = OwnerClassPath.TrimStartAndEnd().Equals(TEXT("custom"), ESearchCase::IgnoreCase)
+				|| OwnerClassPath.TrimStartAndEnd().IsEmpty();
+
+			if (!bCustomEvent)
+			{
+				UClass* OwnerClass = ResolveClassPath(OwnerClassPath, EditorAssetSubsystem);
+				if (!OwnerClass)
+				{
+					return MakeExecutionResult(FString::Printf(TEXT("Unable to resolve ownerClassPath '%s'."), *OwnerClassPath), nullptr, true);
+				}
+				if (!OwnerClass->FindFunctionByName(EventFName))
+				{
+					return MakeExecutionResult(
+						FString::Printf(TEXT("Event function '%s' was not found on class '%s'."), *EventName, *OwnerClass->GetPathName()),
+						nullptr,
+						true);
+				}
+
+				if (UK2Node_Event* ExistingEvent = FBlueprintEditorUtils::FindOverrideForFunction(Blueprint, OwnerClass, EventFName))
+				{
+					TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, ExistingEvent->GetGraph(), ExistingEvent, TEXT("bp_add_event_node"));
+					StructuredContent->SetBoolField(TEXT("created"), false);
+					return MakeExecutionResult(
+						FString::Printf(TEXT("Override event %s already exists in %s."), *EventName, *ObjectPath),
+						StructuredContent,
+						false);
+				}
+
+				const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddEventNode", "Unreal MCP Add Blueprint Event Node"));
+				Graph->Modify();
+				Blueprint->Modify();
+				NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_Event>(
+					Graph,
+					FVector2D(X, Y),
+					EK2NewNodeFlags::None,
+					[EventFName, OwnerClass](UK2Node_Event* NewInstance)
+					{
+						NewInstance->EventReference.SetExternalMember(EventFName, OwnerClass);
+						NewInstance->bOverrideFunction = true;
+					});
+			}
+			else
+			{
+				if (UK2Node_Event* ExistingEvent = FBlueprintEditorUtils::FindCustomEventNode(Blueprint, EventFName))
+				{
+					TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, ExistingEvent->GetGraph(), ExistingEvent, TEXT("bp_add_event_node"));
+					StructuredContent->SetBoolField(TEXT("created"), false);
+					return MakeExecutionResult(
+						FString::Printf(TEXT("Custom event %s already exists in %s."), *EventName, *ObjectPath),
+						StructuredContent,
+						false);
+				}
+
+				const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddCustomEventNode", "Unreal MCP Add Blueprint Custom Event Node"));
+				Graph->Modify();
+				Blueprint->Modify();
+				NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_CustomEvent>(
+					Graph,
+					FVector2D(X, Y),
+					EK2NewNodeFlags::None,
+					[EventFName](UK2Node_CustomEvent* NewInstance)
+					{
+						NewInstance->CustomFunctionName = EventFName;
+					});
+			}
+
+			if (!NewNode)
+			{
+				return MakeExecutionResult(TEXT("Failed to create event node."), nullptr, true);
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, NewNode, TEXT("bp_add_event_node"));
+			StructuredContent->SetBoolField(TEXT("created"), true);
+			StructuredContent->SetBoolField(TEXT("customEvent"), bCustomEvent);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added event node %s to %s:%s."), *EventName, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddInputAxisEventNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_input_axis_event_node");
+			const FString Action = TEXT("bp_add_input_axis_event_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			FString GraphName;
+			FString FailureReason;
+			if (!BlueprintToolReadEventGraphName(Arguments, GraphName, FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("UNSUPPORTED_GRAPH"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			FString AxisName;
+			if (!Arguments.TryGetStringField(TEXT("axisName"), AxisName) || AxisName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'axisName'."), nullptr, true);
+			}
+			AxisName = AxisName.TrimStartAndEnd();
+
+			FString NodeGuid;
+			TArray<FString> PinNames;
+			const FVector2D Location = BlueprintToolReadGraphLocation(Arguments);
+			if (!UUnrealMcpBlueprintGraphLibrary::AddInputAxisEventNode(
+				Blueprint,
+				FName(*AxisName),
+				Location,
+				NodeGuid,
+				PinNames,
+				FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("ADD_NODE_FAILED"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = BlueprintToolMakeCreatedNodeContent(Blueprint, Action, BlueprintPath, NodeGuid, PinNames);
+			StructuredContent->SetStringField(TEXT("axisName"), AxisName);
+			StructuredContent->SetStringField(TEXT("graphName"), GraphName);
+			StructuredContent->SetNumberField(TEXT("x"), Location.X);
+			StructuredContent->SetNumberField(TEXT("y"), Location.Y);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added input axis event node %s to %s:%s."), *AxisName, *ObjectPath, *GraphName),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddInputActionEventNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_input_action_event_node");
+			const FString Action = TEXT("bp_add_input_action_event_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			FString GraphName;
+			FString FailureReason;
+			if (!BlueprintToolReadEventGraphName(Arguments, GraphName, FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("UNSUPPORTED_GRAPH"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			FString ActionName;
+			if (!Arguments.TryGetStringField(TEXT("actionName"), ActionName) || ActionName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'actionName'."), nullptr, true);
+			}
+			ActionName = ActionName.TrimStartAndEnd();
+
+			FString NodeGuid;
+			TArray<FString> PinNames;
+			const FVector2D Location = BlueprintToolReadGraphLocation(Arguments);
+			if (!UUnrealMcpBlueprintGraphLibrary::AddInputActionEventNode(
+				Blueprint,
+				FName(*ActionName),
+				Location,
+				NodeGuid,
+				PinNames,
+				FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("ADD_NODE_FAILED"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = BlueprintToolMakeCreatedNodeContent(Blueprint, Action, BlueprintPath, NodeGuid, PinNames);
+			StructuredContent->SetStringField(TEXT("actionName"), ActionName);
+			StructuredContent->SetStringField(TEXT("graphName"), GraphName);
+			StructuredContent->SetNumberField(TEXT("x"), Location.X);
+			StructuredContent->SetNumberField(TEXT("y"), Location.Y);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added input action event node %s to %s:%s."), *ActionName, *ObjectPath, *GraphName),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddComponentTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_component");
+			const FString Action = TEXT("bp_add_component");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			FString ComponentClassPath;
+			FString ComponentName;
+			FString AttachParentComponentName;
+			if (!Arguments.TryGetStringField(TEXT("componentClass"), ComponentClassPath) || ComponentClassPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'componentClass'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("componentName"), ComponentName) || ComponentName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'componentName'."), nullptr, true);
+			}
+			Arguments.TryGetStringField(TEXT("attachParentComponentName"), AttachParentComponentName);
+			ComponentClassPath = ComponentClassPath.TrimStartAndEnd();
+			ComponentName = ComponentName.TrimStartAndEnd();
+			AttachParentComponentName = AttachParentComponentName.TrimStartAndEnd();
+
+			UClass* ComponentClass = ResolveClassPath(ComponentClassPath, EditorAssetSubsystem);
+			if (!ComponentClass)
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("CLASS_NOT_FOUND"),
+					FString::Printf(TEXT("Unable to resolve componentClass '%s'."), *ComponentClassPath),
+					BlueprintPath);
+			}
+
+			FString CreatedNodeName;
+			FString FailureReason;
+			if (!UUnrealMcpBlueprintComponentLibrary::AddComponentToBlueprint(
+				Blueprint,
+				ComponentClass,
+				FName(*ComponentName),
+				AttachParentComponentName.IsEmpty() ? NAME_None : FName(*AttachParentComponentName),
+				CreatedNodeName,
+				FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("ADD_COMPONENT_FAILED"), FailureReason, BlueprintPath);
+			}
+
+			USCS_Node* CreatedNode = Blueprint->SimpleConstructionScript
+				? Blueprint->SimpleConstructionScript->FindSCSNode(FName(*CreatedNodeName))
+				: nullptr;
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("componentClass"), ComponentClass->GetPathName());
+			StructuredContent->SetStringField(TEXT("componentName"), ComponentName);
+			StructuredContent->SetStringField(TEXT("createdNodeName"), CreatedNodeName);
+			StructuredContent->SetStringField(TEXT("attachParentComponentName"), AttachParentComponentName);
+			StructuredContent->SetBoolField(TEXT("postcheckFoundComponent"), CreatedNode != nullptr);
+			if (CreatedNode && CreatedNode->ComponentTemplate)
+			{
+				StructuredContent->SetStringField(TEXT("componentTemplate"), CreatedNode->ComponentTemplate->GetPathName());
+			}
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added component %s (%s) to %s."), *CreatedNodeName, *ComponentClass->GetPathName(), *ObjectPath),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult SetComponentPropertyTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_set_component_property");
+			const FString Action = TEXT("bp_set_component_property");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			FString ComponentName;
+			FString PropertyName;
+			FString ValueText;
+			if (!Arguments.TryGetStringField(TEXT("componentName"), ComponentName) || ComponentName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'componentName'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("propertyName"), PropertyName) || PropertyName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'propertyName'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("value"), ValueText))
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'value'."), nullptr, true);
+			}
+			ComponentName = ComponentName.TrimStartAndEnd();
+			PropertyName = PropertyName.TrimStartAndEnd();
+
+			FString ReadbackValue;
+			FString FailureReason;
+			if (!UUnrealMcpBlueprintComponentLibrary::SetBlueprintComponentTemplateProperty(
+				Blueprint,
+				FName(*ComponentName),
+				PropertyName,
+				ValueText,
+				ReadbackValue,
+				FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("SET_COMPONENT_PROPERTY_FAILED"), FailureReason, BlueprintPath);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("componentName"), ComponentName);
+			StructuredContent->SetStringField(TEXT("propertyName"), PropertyName);
+			StructuredContent->SetStringField(TEXT("value"), ValueText);
+			StructuredContent->SetStringField(TEXT("readbackValue"), ReadbackValue);
+			StructuredContent->SetBoolField(TEXT("postcheckMatchedReadback"), ReadbackValue.Equals(ValueText, ESearchCase::CaseSensitive));
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Set component property %s.%s on %s; readback=%s."), *ComponentName, *PropertyName, *ObjectPath, *ReadbackValue),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult SetClassDefaultTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_set_class_default");
+			const FString Action = TEXT("bp_set_class_default");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			FString PropertyName;
+			FString ValueText;
+			if (!Arguments.TryGetStringField(TEXT("propertyName"), PropertyName) || PropertyName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'propertyName'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("value"), ValueText))
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'value'."), nullptr, true);
+			}
+			PropertyName = PropertyName.TrimStartAndEnd();
+
+			FString ReadbackValue;
+			FString FailureReason;
+			if (!UUnrealMcpBlueprintComponentLibrary::SetBlueprintClassDefaultProperty(
+				Blueprint,
+				PropertyName,
+				ValueText,
+				ReadbackValue,
+				FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("SET_CLASS_DEFAULT_FAILED"), FailureReason, BlueprintPath);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, Action);
+			StructuredContent->SetStringField(TEXT("blueprintPath"), BlueprintPath);
+			StructuredContent->SetStringField(TEXT("propertyName"), PropertyName);
+			StructuredContent->SetStringField(TEXT("value"), ValueText);
+			StructuredContent->SetStringField(TEXT("readbackValue"), ReadbackValue);
+			StructuredContent->SetBoolField(TEXT("postcheckMatchedReadback"), ReadbackValue.Equals(ValueText, ESearchCase::CaseSensitive));
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Set class default %s on %s; readback=%s."), *PropertyName, *ObjectPath, *ReadbackValue),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddGameplayNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_gameplay_node");
+			const FString Action = TEXT("bp_add_gameplay_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			FString BlueprintPath;
+			FString ObjectPath;
+			UBlueprint* Blueprint = nullptr;
+			FUnrealMcpExecutionResult ErrorResult;
+			if (!BlueprintToolLoadBlueprintForWrite(Arguments, Action, BlueprintPath, ObjectPath, Blueprint, ErrorResult))
+			{
+				return ErrorResult;
+			}
+
+			FString GraphName;
+			FString FailureReason;
+			if (!BlueprintToolReadEventGraphName(Arguments, GraphName, FailureReason))
+			{
+				return MakeBlueprintToolError(Action, TEXT("UNSUPPORTED_GRAPH"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			FString NodeKind;
+			if (!Arguments.TryGetStringField(TEXT("nodeKind"), NodeKind) || NodeKind.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'nodeKind'."), nullptr, true);
+			}
+			NodeKind = NodeKind.TrimStartAndEnd();
+
+			FString NodeGuid;
+			TArray<FString> PinNames;
+			FString RoutedFunctionName;
+			FString RoutedContextClassPath;
+			const FVector2D Location = BlueprintToolReadGraphLocation(Arguments);
+			bool bAdded = false;
+
+			if (NodeKind == TEXT("AddMovementInput"))
+			{
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddMovementInputCallNode(Blueprint, Location, NodeGuid, PinNames, FailureReason);
+				RoutedFunctionName = TEXT("AddMovementInput");
+				RoutedContextClassPath = TEXT("/Script/Engine.Pawn");
+			}
+			else if (NodeKind == TEXT("AddControllerYawInput"))
+			{
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddControllerYawInputCallNode(Blueprint, Location, NodeGuid, PinNames, FailureReason);
+				RoutedFunctionName = TEXT("AddControllerYawInput");
+				RoutedContextClassPath = TEXT("/Script/Engine.Pawn");
+			}
+			else if (NodeKind == TEXT("AddControllerPitchInput"))
+			{
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddControllerPitchInputCallNode(Blueprint, Location, NodeGuid, PinNames, FailureReason);
+				RoutedFunctionName = TEXT("AddControllerPitchInput");
+				RoutedContextClassPath = TEXT("/Script/Engine.Pawn");
+			}
+			else if (NodeKind == TEXT("GetActorForwardVector"))
+			{
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddGetActorForwardVectorNode(Blueprint, Location, NodeGuid, PinNames, FailureReason);
+				RoutedFunctionName = TEXT("GetActorForwardVector");
+				RoutedContextClassPath = TEXT("/Script/Engine.Actor");
+			}
+			else if (NodeKind == TEXT("GetActorRightVector"))
+			{
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddGetActorRightVectorNode(Blueprint, Location, NodeGuid, PinNames, FailureReason);
+				RoutedFunctionName = TEXT("GetActorRightVector");
+				RoutedContextClassPath = TEXT("/Script/Engine.Actor");
+			}
+			else if (NodeKind == TEXT("GetControlRotation"))
+			{
+				RoutedFunctionName = TEXT("GetControlRotation");
+				RoutedContextClassPath = TEXT("/Script/Engine.Pawn");
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddCallFunctionNode(Blueprint, FName(*RoutedFunctionName), RoutedContextClassPath, Location, NodeGuid, PinNames, FailureReason);
+			}
+			else if (NodeKind == TEXT("Jump"))
+			{
+				RoutedFunctionName = TEXT("Jump");
+				RoutedContextClassPath = TEXT("/Script/Engine.Character");
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddCallFunctionNode(Blueprint, FName(*RoutedFunctionName), RoutedContextClassPath, Location, NodeGuid, PinNames, FailureReason);
+			}
+			else if (NodeKind == TEXT("FloatGreaterThan"))
+			{
+				RoutedFunctionName = TEXT("Greater_DoubleDouble");
+				RoutedContextClassPath = TEXT("/Script/Engine.KismetMathLibrary");
+				bAdded = UUnrealMcpBlueprintGraphLibrary::AddCallFunctionNode(Blueprint, FName(*RoutedFunctionName), RoutedContextClassPath, Location, NodeGuid, PinNames, FailureReason);
+			}
+			else
+			{
+				return MakeBlueprintToolError(
+					Action,
+					TEXT("UNSUPPORTED_NODE_KIND"),
+					FString::Printf(TEXT("Unsupported nodeKind '%s'."), *NodeKind),
+					BlueprintPath,
+					GraphName);
+			}
+
+			if (!bAdded)
+			{
+				return MakeBlueprintToolError(Action, TEXT("ADD_NODE_FAILED"), FailureReason, BlueprintPath, GraphName);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = BlueprintToolMakeCreatedNodeContent(Blueprint, Action, BlueprintPath, NodeGuid, PinNames);
+			StructuredContent->SetStringField(TEXT("nodeKind"), NodeKind);
+			StructuredContent->SetStringField(TEXT("functionName"), RoutedFunctionName);
+			StructuredContent->SetStringField(TEXT("contextClassPath"), RoutedContextClassPath);
+			StructuredContent->SetStringField(TEXT("graphName"), GraphName);
+			StructuredContent->SetNumberField(TEXT("x"), Location.X);
+			StructuredContent->SetNumberField(TEXT("y"), Location.Y);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added gameplay node %s to %s:%s."), *NodeKind, *ObjectPath, *GraphName),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddCallFunctionNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_call_function_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString FunctionClassPath;
+			FString FunctionName;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("functionClassPath"), FunctionClassPath) || FunctionClassPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'functionClassPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("functionName"), FunctionName) || FunctionName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'functionName'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			double X = 200.0;
+			double Y = 0.0;
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetNumberField(TEXT("x"), X);
+			Arguments.TryGetNumberField(TEXT("y"), Y);
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, true, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UFunction* Function = ResolveFunctionByClassAndName(EditorAssetSubsystem, FunctionClassPath, FunctionName, FailureReason);
+			if (!Function)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddCallFunctionNode", "Unreal MCP Add Blueprint Call Function Node"));
+			Graph->Modify();
+			Blueprint->Modify();
+			UK2Node_CallFunction* NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_CallFunction>(
+				Graph,
+				FVector2D(X, Y),
+				EK2NewNodeFlags::None,
+				[Function](UK2Node_CallFunction* NewInstance)
+				{
+					NewInstance->SetFromFunction(Function);
+				});
+			if (!NewNode)
+			{
+				return MakeExecutionResult(TEXT("Failed to create call-function node."), nullptr, true);
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, NewNode, TEXT("bp_add_call_function_node"));
+			StructuredContent->SetStringField(TEXT("function"), Function->GetPathName());
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added call-function node %s to %s:%s."), *FunctionName, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddBranchNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_branch_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			double X = 400.0;
+			double Y = 0.0;
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetNumberField(TEXT("x"), X);
+			Arguments.TryGetNumberField(TEXT("y"), Y);
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, true, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddBranchNode", "Unreal MCP Add Blueprint Branch Node"));
+			Graph->Modify();
+			Blueprint->Modify();
+			UK2Node_IfThenElse* NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_IfThenElse>(
+				Graph,
+				FVector2D(X, Y),
+				EK2NewNodeFlags::None);
+			if (!NewNode)
+			{
+				return MakeExecutionResult(TEXT("Failed to create Branch node."), nullptr, true);
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, NewNode, TEXT("bp_add_branch_node"));
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added Branch node to %s:%s."), *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult AddForEachNodeTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_add_for_each_node");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			FString MacroName = TEXT("ForEachLoop");
+			double X = 400.0;
+			double Y = 180.0;
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetStringField(TEXT("macroName"), MacroName);
+			Arguments.TryGetNumberField(TEXT("x"), X);
+			Arguments.TryGetNumberField(TEXT("y"), Y);
+
+			UEdGraph* MacroGraph = FindStandardMacroGraph(MacroName);
+			if (!MacroGraph)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Unable to find StandardMacros graph '%s'."), *MacroName), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, true, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpAddForEachNode", "Unreal MCP Add Blueprint ForEach Node"));
+			Graph->Modify();
+			Blueprint->Modify();
+			UK2Node_MacroInstance* NewNode = FEdGraphSchemaAction_K2NewNode::SpawnNode<UK2Node_MacroInstance>(
+				Graph,
+				FVector2D(X, Y),
+				EK2NewNodeFlags::None,
+				[MacroGraph](UK2Node_MacroInstance* NewInstance)
+				{
+					NewInstance->SetMacroGraph(MacroGraph);
+				});
+			if (!NewNode)
+			{
+				return MakeExecutionResult(TEXT("Failed to create ForEach macro node."), nullptr, true);
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, NewNode, TEXT("bp_add_for_each_node"));
+			StructuredContent->SetStringField(TEXT("macroName"), MacroGraph->GetName());
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Added %s node to %s:%s."), *MacroGraph->GetName(), *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult ConnectPinsTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_connect_pins");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString FromNodeGuid;
+			FString FromPinName;
+			FString ToNodeGuid;
+			FString ToPinName;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("fromNodeGuid"), FromNodeGuid) || FromNodeGuid.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'fromNodeGuid'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("fromPin"), FromPinName) || FromPinName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'fromPin'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("toNodeGuid"), ToNodeGuid) || ToNodeGuid.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'toNodeGuid'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("toPin"), ToPinName) || ToPinName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'toPin'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			UEdGraphNode* FromNode = FindBlueprintNodeByGuid(Graph, FromNodeGuid);
+			UEdGraphNode* ToNode = FindBlueprintNodeByGuid(Graph, ToNodeGuid);
+			if (!FromNode || !ToNode)
+			{
+				return MakeExecutionResult(TEXT("Unable to find one or both nodes by GUID in the target graph."), nullptr, true);
+			}
+
+			UEdGraphPin* FromPin = FindBlueprintPinByName(FromNode, FromPinName);
+			UEdGraphPin* ToPin = FindBlueprintPinByName(ToNode, ToPinName);
+			if (!FromPin || !ToPin)
+			{
+				return MakeExecutionResult(TEXT("Unable to find one or both pins by name/displayName."), nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpConnectPins", "Unreal MCP Connect Blueprint Pins"));
+			Graph->Modify();
+			FromNode->Modify();
+			ToNode->Modify();
+			const bool bConnected = Graph->GetSchema() && Graph->GetSchema()->TryCreateConnection(FromPin, ToPin);
+			if (!bConnected)
+			{
+				return MakeExecutionResult(
+					FString::Printf(TEXT("K2 schema rejected connection %s.%s -> %s.%s."), *FromNodeGuid, *FromPinName, *ToNodeGuid, *ToPinName),
+					nullptr,
+					true);
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, nullptr, TEXT("bp_connect_pins"));
+			StructuredContent->SetObjectField(TEXT("fromNode"), DescribeBlueprintNode(FromNode));
+			StructuredContent->SetObjectField(TEXT("toNode"), DescribeBlueprintNode(ToNode));
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Connected %s.%s -> %s.%s in %s:%s."), *FromNodeGuid, *FromPinName, *ToNodeGuid, *ToPinName, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult SetPinDefaultTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_set_pin_default");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			FString NodeGuid;
+			FString PinName;
+			FString Value;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("nodeGuid"), NodeGuid) || NodeGuid.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'nodeGuid'."), nullptr, true);
+			}
+			if (!Arguments.TryGetStringField(TEXT("pinName"), PinName) || PinName.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'pinName'."), nullptr, true);
+			}
+			Arguments.TryGetStringField(TEXT("value"), Value);
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			UEdGraphNode* Node = FindBlueprintNodeByGuid(Graph, NodeGuid);
+			if (!Node)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Unable to find node '%s' in graph '%s'."), *NodeGuid, *Graph->GetName()), nullptr, true);
+			}
+
+			UEdGraphPin* Pin = FindBlueprintPinByName(Node, PinName);
+			if (!Pin)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Unable to find pin '%s' on node '%s'."), *PinName, *NodeGuid), nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpSetPinDefault", "Unreal MCP Set Blueprint Pin Default"));
+			Graph->Modify();
+			Node->Modify();
+			if (!Graph->GetSchema())
+			{
+				return MakeExecutionResult(TEXT("Target graph has no schema."), nullptr, true);
+			}
+
+			Graph->GetSchema()->TrySetDefaultValue(*Pin, Value);
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, Node, TEXT("bp_set_pin_default"));
+			StructuredContent->SetObjectField(TEXT("pin"), DescribeBlueprintPin(Pin));
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Set default value for %s.%s to '%s' in %s:%s."), *NodeGuid, *PinName, *Value, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult ArrangeGraphTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_arrange_graph");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+
+			FString GraphName = UEdGraphSchema_K2::GN_EventGraph.ToString();
+			double OriginX = 0.0;
+			double OriginY = 0.0;
+			double ColumnSpacing = 320.0;
+			double RowSpacing = 180.0;
+			Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+			Arguments.TryGetNumberField(TEXT("originX"), OriginX);
+			Arguments.TryGetNumberField(TEXT("originY"), OriginY);
+			Arguments.TryGetNumberField(TEXT("columnSpacing"), ColumnSpacing);
+			Arguments.TryGetNumberField(TEXT("rowSpacing"), RowSpacing);
+			const int32 Columns = FMath::Max(1, GetPositiveIntArgument(Arguments, TEXT("columns"), 4));
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			const FScopedTransaction Transaction(LOCTEXT("UnrealMcpBpArrangeGraph", "Unreal MCP Arrange Blueprint Graph"));
+			Graph->Modify();
+
+			int32 ArrangedCount = 0;
+			for (UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (!Node)
+				{
+					continue;
+				}
+
+				const int32 Column = ArrangedCount % Columns;
+				const int32 Row = ArrangedCount / Columns;
+				Node->Modify();
+				Node->NodePosX = static_cast<int32>(OriginX + Column * ColumnSpacing);
+				Node->NodePosY = static_cast<int32>(OriginY + Row * RowSpacing);
+				++ArrangedCount;
+			}
+
+			Graph->NotifyGraphChanged();
+			FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+			Blueprint->MarkPackageDirty();
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, Graph, nullptr, TEXT("bp_arrange_graph"));
+			StructuredContent->SetNumberField(TEXT("arrangedCount"), ArrangedCount);
+			StructuredContent->SetNumberField(TEXT("columns"), Columns);
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Arranged %d nodes in %s:%s."), ArrangedCount, *ObjectPath, *Graph->GetName()),
+				StructuredContent,
+				false);
+		}
+
+		FUnrealMcpExecutionResult CompileSaveTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.bp_compile_save");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GetEditorAssetSubsystem();
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString BlueprintPath;
+			if (!Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath) || BlueprintPath.TrimStartAndEnd().IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("Missing required field 'blueprintPath'."), nullptr, true);
+			}
+
+			bool bSavePackage = true;
+			Arguments.TryGetBoolField(TEXT("savePackage"), bSavePackage);
+
+			FString ObjectPath;
+			FString FailureReason;
+			UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+
+			FKismetEditorUtilities::CompileBlueprint(Blueprint);
+			const bool bCompileSucceeded = Blueprint->Status != BS_Error;
+			bool bSaved = false;
+			if (bSavePackage)
+			{
+				bSaved = EditorAssetSubsystem->SaveLoadedAsset(Blueprint, false);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeBlueprintEditStructuredContent(Blueprint, nullptr, nullptr, TEXT("bp_compile_save"));
+			StructuredContent->SetStringField(TEXT("objectPath"), ObjectPath);
+			StructuredContent->SetStringField(TEXT("status"), StaticEnum<EBlueprintStatus>()->GetNameStringByValue(static_cast<int64>(Blueprint->Status)));
+			StructuredContent->SetBoolField(TEXT("compileSucceeded"), bCompileSucceeded);
+			StructuredContent->SetBoolField(TEXT("savePackage"), bSavePackage);
+			StructuredContent->SetBoolField(TEXT("saved"), bSaved);
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Compiled Blueprint %s. status=%s saved=%s"), *ObjectPath, bCompileSucceeded ? TEXT("success") : TEXT("error"), bSaved ? TEXT("true") : TEXT("false")),
+				StructuredContent,
+				!bCompileSucceeded || (bSavePackage && !bSaved));
+		}
+
+		FUnrealMcpExecutionResult CompileBlueprintTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.compile_blueprint");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString AssetPath;
+			if (!Arguments.TryGetStringField(TEXT("path"), AssetPath) || AssetPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("The path argument is required."), nullptr, true);
+			}
+
+			FString ObjectPath;
+			FString FailureReason;
+			UObject* LoadedAsset = LoadAssetFromAnyPath(EditorAssetSubsystem, AssetPath, ObjectPath, FailureReason);
+			UBlueprint* Blueprint = Cast<UBlueprint>(LoadedAsset);
+			if (!Blueprint)
+			{
+				return MakeExecutionResult(
+					LoadedAsset
+						? FString::Printf(TEXT("Asset '%s' is not a Blueprint."), *ObjectPath)
+						: FailureReason,
+					nullptr,
+					true);
+			}
+
+			FKismetEditorUtilities::CompileBlueprint(Blueprint);
+			const bool bSucceeded = Blueprint->Status != BS_Error;
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+			StructuredContent->SetStringField(TEXT("objectPath"), ObjectPath);
+			StructuredContent->SetStringField(TEXT("status"), StaticEnum<EBlueprintStatus>()->GetNameStringByValue(static_cast<int64>(Blueprint->Status)));
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Compiled Blueprint %s. status=%s"), *ObjectPath, bSucceeded ? TEXT("success") : TEXT("error")),
+				StructuredContent,
+				!bSucceeded);
+		}
+
+		FUnrealMcpExecutionResult CompileBlueprintsInPathTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.compile_blueprints_in_path");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString Path = TEXT("/Game");
+			bool bRecursive = true;
+			Arguments.TryGetStringField(TEXT("path"), Path);
+			Arguments.TryGetBoolField(TEXT("recursive"), bRecursive);
+			const int32 Limit = FMath::Min(GetPositiveIntArgument(Arguments, TEXT("limit"), 100), 500);
+
+			if (Path.IsEmpty() || !Path.StartsWith(TEXT("/")))
+			{
+				return MakeExecutionResult(TEXT("The path argument must be a Content Browser path like /Game."), nullptr, true);
+			}
+
+			FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+
+			FARFilter Filter;
+			Filter.PackagePaths.Add(*Path);
+			Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+			Filter.bRecursivePaths = bRecursive;
+			Filter.bRecursiveClasses = true;
+
+			TArray<FAssetData> AssetData;
+			AssetRegistryModule.Get().GetAssets(Filter, AssetData);
+			AssetData.Sort([](const FAssetData& A, const FAssetData& B)
+			{
+				return A.GetSoftObjectPath().ToString() < B.GetSoftObjectPath().ToString();
+			});
+
+			int32 CompiledCount = 0;
+			int32 SuccessCount = 0;
+			int32 FailureCount = 0;
+			bool bTruncated = false;
+			TArray<TSharedPtr<FJsonValue>> ResultsArray;
+			TArray<FString> FailureLines;
+
+			for (const FAssetData& Asset : AssetData)
+			{
+				if (CompiledCount >= Limit)
+				{
+					bTruncated = true;
+					break;
+				}
+
+				UObject* LoadedAsset = EditorAssetSubsystem->LoadAsset(Asset.GetSoftObjectPath().ToString());
+				UBlueprint* Blueprint = Cast<UBlueprint>(LoadedAsset);
+				if (!Blueprint)
+				{
+					continue;
+				}
+
+				FKismetEditorUtilities::CompileBlueprint(Blueprint);
+
+				++CompiledCount;
+				const bool bSucceeded = Blueprint->Status != BS_Error;
+				if (bSucceeded)
+				{
+					++SuccessCount;
+				}
+				else
+				{
+					++FailureCount;
+					FailureLines.Add(Asset.GetSoftObjectPath().ToString());
+				}
+
+				TSharedPtr<FJsonObject> ResultObject = MakeShared<FJsonObject>();
+				ResultObject->SetStringField(TEXT("objectPath"), Asset.GetSoftObjectPath().ToString());
+				ResultObject->SetStringField(TEXT("status"), StaticEnum<EBlueprintStatus>()->GetNameStringByValue(static_cast<int64>(Blueprint->Status)));
+				ResultObject->SetBoolField(TEXT("success"), bSucceeded);
+				ResultsArray.Add(MakeShared<FJsonValueObject>(ResultObject));
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+			StructuredContent->SetStringField(TEXT("path"), Path);
+			StructuredContent->SetBoolField(TEXT("recursive"), bRecursive);
+			StructuredContent->SetNumberField(TEXT("limit"), Limit);
+			StructuredContent->SetNumberField(TEXT("totalBlueprintAssets"), AssetData.Num());
+			StructuredContent->SetNumberField(TEXT("compiledCount"), CompiledCount);
+			StructuredContent->SetNumberField(TEXT("successCount"), SuccessCount);
+			StructuredContent->SetNumberField(TEXT("failureCount"), FailureCount);
+			StructuredContent->SetBoolField(TEXT("truncated"), bTruncated);
+			StructuredContent->SetArrayField(TEXT("results"), ResultsArray);
+
+			FString Text = FString::Printf(
+				TEXT("Compiled %d Blueprint assets under %s. success=%d failure=%d"),
+				CompiledCount,
+				*Path,
+				SuccessCount,
+				FailureCount);
+			if (bTruncated)
+			{
+				Text += FString::Printf(TEXT(" (stopped at limit %d)"), Limit);
+			}
+			if (FailureLines.Num() > 0)
+			{
+				Text += TEXT("\nFailed:\n") + FString::Join(FailureLines, TEXT("\n"));
+			}
+
+			return MakeExecutionResult(Text, StructuredContent, FailureCount > 0);
+		}
+
+		FUnrealMcpExecutionResult CreateBlueprintClassTool(const FJsonObject& Arguments)
+		{
+			const FString ToolName = TEXT("unreal.create_blueprint_class");
+			if (IsEditorPlaying())
+			{
+				return MakePieBlockedResult(ToolName);
+			}
+
+			UEditorAssetSubsystem* EditorAssetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+			if (!EditorAssetSubsystem)
+			{
+				return MakeExecutionResult(TEXT("EditorAssetSubsystem is unavailable."), nullptr, true);
+			}
+
+			FString AssetPath;
+			if (!Arguments.TryGetStringField(TEXT("assetPath"), AssetPath) || AssetPath.IsEmpty())
+			{
+				return MakeExecutionResult(TEXT("The assetPath argument is required."), nullptr, true);
+			}
+
+			FString ParentClassPath = TEXT("/Script/Engine.Actor");
+			bool bOpenAfterCreate = true;
+			bool bCompile = true;
+			Arguments.TryGetStringField(TEXT("parentClass"), ParentClassPath);
+			Arguments.TryGetBoolField(TEXT("openAfterCreate"), bOpenAfterCreate);
+			Arguments.TryGetBoolField(TEXT("compile"), bCompile);
+
+			UClass* ParentClass = ResolveClassPath(ParentClassPath, EditorAssetSubsystem);
+			if (!ParentClass)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Unable to resolve parent class '%s'."), *ParentClassPath), nullptr, true);
+			}
+
+			if (!FKismetEditorUtilities::CanCreateBlueprintOfClass(ParentClass))
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Cannot create a Blueprint from class '%s'."), *ParentClass->GetPathName()), nullptr, true);
+			}
+
+			FString FailureReason;
+			const FString ObjectPath = EditorScriptingHelpers::ConvertAnyPathToObjectPath(AssetPath, FailureReason);
+			if (ObjectPath.IsEmpty())
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Unable to resolve asset path: %s"), *FailureReason), nullptr, true);
+			}
+
+			if (!EditorScriptingHelpers::IsAValidPathForCreateNewAsset(ObjectPath, FailureReason))
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Invalid asset path '%s': %s"), *ObjectPath, *FailureReason), nullptr, true);
+			}
+
+			if (EditorAssetSubsystem->DoesAssetExist(ObjectPath))
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Asset '%s' already exists."), *ObjectPath), nullptr, true);
+			}
+
+			const FString PackageName = FPackageName::ObjectPathToPackageName(ObjectPath);
+			const FName AssetName(*FPackageName::GetLongPackageAssetName(PackageName));
+			UPackage* Package = CreatePackage(*PackageName);
+			if (!Package)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Failed to create package '%s'."), *PackageName), nullptr, true);
+			}
+
+			UClass* BlueprintClass = nullptr;
+			UClass* BlueprintGeneratedClass = nullptr;
+			IKismetCompilerInterface& KismetCompilerModule = FModuleManager::LoadModuleChecked<IKismetCompilerInterface>(KISMET_COMPILER_MODULENAME);
+			KismetCompilerModule.GetBlueprintTypesForClass(ParentClass, BlueprintClass, BlueprintGeneratedClass);
+
+			UBlueprint* NewBlueprint = FKismetEditorUtilities::CreateBlueprint(
+				ParentClass,
+				Package,
+				AssetName,
+				BPTYPE_Normal,
+				BlueprintClass,
+				BlueprintGeneratedClass,
+				FName(TEXT("UnrealMcp")));
+
+			if (!NewBlueprint)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Failed to create Blueprint '%s'."), *ObjectPath), nullptr, true);
+			}
+
+			FAssetRegistryModule::AssetCreated(NewBlueprint);
+			Package->MarkPackageDirty();
+
+			if (bCompile)
+			{
+				FKismetEditorUtilities::CompileBlueprint(NewBlueprint);
+			}
+
+			UAssetEditorSubsystem* AssetEditorSubsystem = GEditor ? GEditor->GetEditorSubsystem<UAssetEditorSubsystem>() : nullptr;
+			if (bOpenAfterCreate && AssetEditorSubsystem)
+			{
+				AssetEditorSubsystem->OpenEditorForAsset(NewBlueprint);
+			}
+
+			TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+			StructuredContent->SetStringField(TEXT("objectPath"), ObjectPath);
+			StructuredContent->SetStringField(TEXT("packageName"), PackageName);
+			StructuredContent->SetStringField(TEXT("parentClass"), ParentClass->GetPathName());
+			StructuredContent->SetBoolField(TEXT("compiled"), bCompile);
+			StructuredContent->SetBoolField(TEXT("opened"), bOpenAfterCreate);
+			if (NewBlueprint->GeneratedClass)
+			{
+				StructuredContent->SetStringField(TEXT("generatedClass"), NewBlueprint->GeneratedClass->GetPathName());
+			}
+
+			return MakeExecutionResult(
+				FString::Printf(TEXT("Created Blueprint %s with parent %s."), *ObjectPath, *ParentClass->GetPathName()),
+				StructuredContent,
+				false);
+		}
+	}
+
+	FUnrealMcpExecutionResult ListGraphNodesTool(const FJsonObject& Arguments)
+	{
+		FString BlueprintPath;
+		FString GraphName;
+		bool bIncludePins = true;
+		Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+		Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+		Arguments.TryGetBoolField(TEXT("includePins"), bIncludePins);
+
+		if (BlueprintPath.TrimStartAndEnd().IsEmpty())
+		{
+			return MakeExecutionResult(TEXT("Provide blueprintPath."), nullptr, true);
+		}
+
+		UEditorAssetSubsystem* EditorAssetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+		FString ObjectPath;
+		FString FailureReason;
+		UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+		if (!Blueprint)
+		{
+			return MakeExecutionResult(FailureReason, nullptr, true);
+		}
+
+		TArray<UEdGraph*> Graphs;
+		if (GraphName.TrimStartAndEnd().IsEmpty())
+		{
+			GatherBlueprintGraphs(Blueprint, Graphs);
+		}
+		else
+		{
+			UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+			if (!Graph)
+			{
+				return MakeExecutionResult(FailureReason, nullptr, true);
+			}
+			Graphs.Add(Graph);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> GraphValues;
+		int32 NodeCount = 0;
+		for (UEdGraph* Graph : Graphs)
+		{
+			if (!Graph)
+			{
+				continue;
+			}
+			NodeCount += Graph->Nodes.Num();
+			GraphValues.Add(MakeShared<FJsonValueObject>(DescribeBlueprintGraph(Graph, bIncludePins)));
+		}
+
+		TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+		StructuredContent->SetStringField(TEXT("action"), TEXT("bp_list_graph_nodes"));
+		StructuredContent->SetStringField(TEXT("blueprintPath"), ObjectPath);
+		StructuredContent->SetNumberField(TEXT("graphCount"), GraphValues.Num());
+		StructuredContent->SetNumberField(TEXT("nodeCount"), NodeCount);
+		StructuredContent->SetBoolField(TEXT("includePins"), bIncludePins);
+		StructuredContent->SetArrayField(TEXT("graphs"), GraphValues);
+		return MakeExecutionResult(FString::Printf(TEXT("Listed %d Blueprint graph node(s) across %d graph(s)."), NodeCount, GraphValues.Num()), StructuredContent, false);
+	}
+
+	FUnrealMcpExecutionResult TracePinConnectionsTool(const FJsonObject& Arguments)
+	{
+		FString BlueprintPath;
+		FString GraphName = TEXT("EventGraph");
+		FString NodeGuid;
+		FString PinName;
+		Arguments.TryGetStringField(TEXT("blueprintPath"), BlueprintPath);
+		Arguments.TryGetStringField(TEXT("graphName"), GraphName);
+		Arguments.TryGetStringField(TEXT("nodeGuid"), NodeGuid);
+		Arguments.TryGetStringField(TEXT("pinName"), PinName);
+
+		if (BlueprintPath.TrimStartAndEnd().IsEmpty())
+		{
+			return MakeExecutionResult(TEXT("Provide blueprintPath."), nullptr, true);
+		}
+		if (NodeGuid.TrimStartAndEnd().IsEmpty())
+		{
+			return MakeExecutionResult(TEXT("Provide nodeGuid."), nullptr, true);
+		}
+
+		UEditorAssetSubsystem* EditorAssetSubsystem = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+		FString ObjectPath;
+		FString FailureReason;
+		UBlueprint* Blueprint = LoadBlueprintAsset(EditorAssetSubsystem, BlueprintPath, ObjectPath, FailureReason);
+		if (!Blueprint)
+		{
+			return MakeExecutionResult(FailureReason, nullptr, true);
+		}
+
+		UEdGraph* Graph = ResolveBlueprintGraph(Blueprint, GraphName, false, FailureReason);
+		if (!Graph)
+		{
+			return MakeExecutionResult(FailureReason, nullptr, true);
+		}
+
+		UEdGraphNode* Node = FindBlueprintNodeByGuid(Graph, NodeGuid);
+		if (!Node)
+		{
+			return MakeExecutionResult(FString::Printf(TEXT("Node '%s' was not found in graph '%s'."), *NodeGuid, *Graph->GetName()), nullptr, true);
+		}
+
+		TArray<TSharedPtr<FJsonValue>> PinValues;
+		if (PinName.TrimStartAndEnd().IsEmpty())
+		{
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (Pin)
+				{
+					PinValues.Add(MakeShared<FJsonValueObject>(DescribeBlueprintPin(Pin)));
+				}
+			}
+		}
+		else
+		{
+			UEdGraphPin* Pin = FindBlueprintPinByName(Node, PinName);
+			if (!Pin)
+			{
+				return MakeExecutionResult(FString::Printf(TEXT("Pin '%s' was not found on node '%s'."), *PinName, *NodeGuid), nullptr, true);
+			}
+			PinValues.Add(MakeShared<FJsonValueObject>(DescribeBlueprintPin(Pin)));
+		}
+
+		TSharedPtr<FJsonObject> StructuredContent = MakeShared<FJsonObject>();
+		StructuredContent->SetStringField(TEXT("action"), TEXT("bp_trace_pin_connections"));
+		StructuredContent->SetStringField(TEXT("blueprintPath"), ObjectPath);
+		StructuredContent->SetStringField(TEXT("graph"), Graph->GetName());
+		StructuredContent->SetObjectField(TEXT("node"), DescribeBlueprintNode(Node));
+		StructuredContent->SetArrayField(TEXT("pins"), PinValues);
+		return MakeExecutionResult(FString::Printf(TEXT("Traced %d pin(s) on node %s."), PinValues.Num(), *NodeGuid), StructuredContent, false);
+	}
+
+	bool TryExecuteBlueprintTool(const FString& ToolName, const FJsonObject& Arguments, FUnrealMcpExecutionResult& OutResult)
+	{
+		if (ToolName == TEXT("unreal.bp_list_graph_nodes"))
+		{
+			OutResult = ListGraphNodesTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_trace_pin_connections"))
+		{
+			OutResult = TracePinConnectionsTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_variable"))
+		{
+			OutResult = AddVariableTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_function"))
+		{
+			OutResult = AddFunctionTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_macro_graph"))
+		{
+			OutResult = AddMacroGraphTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_delete_macro_graph"))
+		{
+			OutResult = DeleteMacroGraphTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_interface_add"))
+		{
+			OutResult = AddInterfaceTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_interface_remove"))
+		{
+			OutResult = RemoveInterfaceTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_delete_node"))
+		{
+			OutResult = DeleteNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_delete_variable"))
+		{
+			OutResult = DeleteVariableTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_delete_function"))
+		{
+			OutResult = DeleteFunctionTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_rename_variable"))
+		{
+			OutResult = RenameVariableTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_rename_function"))
+		{
+			OutResult = RenameFunctionTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_event_node"))
+		{
+			OutResult = AddEventNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_input_axis_event_node"))
+		{
+			OutResult = AddInputAxisEventNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_input_action_event_node"))
+		{
+			OutResult = AddInputActionEventNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_component"))
+		{
+			OutResult = AddComponentTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_set_component_property"))
+		{
+			OutResult = SetComponentPropertyTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_set_class_default"))
+		{
+			OutResult = SetClassDefaultTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_gameplay_node"))
+		{
+			OutResult = AddGameplayNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_call_function_node"))
+		{
+			OutResult = AddCallFunctionNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_branch_node"))
+		{
+			OutResult = AddBranchNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_add_for_each_node"))
+		{
+			OutResult = AddForEachNodeTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_connect_pins"))
+		{
+			OutResult = ConnectPinsTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_set_pin_default"))
+		{
+			OutResult = SetPinDefaultTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_arrange_graph"))
+		{
+			OutResult = ArrangeGraphTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.bp_compile_save"))
+		{
+			OutResult = CompileSaveTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.compile_blueprint"))
+		{
+			OutResult = CompileBlueprintTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.compile_blueprints_in_path"))
+		{
+			OutResult = CompileBlueprintsInPathTool(Arguments);
+			return true;
+		}
+
+		if (ToolName == TEXT("unreal.create_blueprint_class"))
+		{
+			OutResult = CreateBlueprintClassTool(Arguments);
+			return true;
+		}
+
+		return false;
+	}
+}
+
+#undef LOCTEXT_NAMESPACE
